@@ -62,6 +62,7 @@ import faulthandler
 import os
 import gc
 import sys
+import heapq
 import queue
 import struct
 import weakref
@@ -69,7 +70,8 @@ import warnings
 import itertools
 import traceback
 import threading
-from time import time, sleep
+import importlib
+from time import time, sleep, monotonic
 import multiprocessing as mp
 from functools import partial
 from pickle import PicklingError
@@ -82,7 +84,12 @@ from ._base import Future
 from .backend import get_context
 from .backend.context import cpu_count, _MAX_WINDOWS_WORKERS
 from .backend.queues import Queue, SimpleQueue
-from .backend.reduction import set_loky_pickler, get_loky_pickler_name
+from .backend.reduction import (
+    set_loky_pickler,
+    get_loky_pickler_name,
+    dumps,
+    loads,
+)
 from .backend.utils import kill_process_tree, get_exitcodes_terminated_worker
 from .initializers import _prepare_initializer
 
@@ -274,20 +281,196 @@ def _rebuild_exc(exc, tb):
 
 class _WorkItem:
 
-    __slots__ = ["future", "fn", "args", "kwargs"]
+    __slots__ = [
+        "future",
+        "fn",
+        "args",
+        "kwargs",
+        "retry_policy",
+        "snapshot",
+    ]
 
-    def __init__(self, future, fn, args, kwargs):
+    def __init__(
+        self,
+        future,
+        fn,
+        args,
+        kwargs,
+        retry_policy=None,
+        snapshot=None,
+    ):
         self.future = future
         self.fn = fn
         self.args = args
         self.kwargs = kwargs
+        # ``retry_policy`` and ``snapshot`` are only set for work items created
+        # through ``ProcessPoolExecutor.submit_retry``. Plain ``submit`` items
+        # keep the default ``None`` values and are never retried.
+        self.retry_policy = retry_policy
+        self.snapshot = snapshot
+
+
+def _validate_retryable_exceptions(retry_on):
+    """Normalize and validate the ``retry_on`` argument of ``submit_retry``.
+
+    The caller must explicitly provide exception classes that can be imported
+    by their qualified name, so that both the parent process and the workers
+    resolve the exact same type. Only subclasses of the regular ``Exception``
+    hierarchy are accepted: ``BaseException``-only errors (such as
+    ``KeyboardInterrupt`` or ``SystemExit``) must never be retried.
+    """
+    if isinstance(retry_on, type):
+        exc_types = (retry_on,)
+    else:
+        try:
+            exc_types = tuple(retry_on)
+        except TypeError:
+            raise TypeError(
+                "retry_on must be an exception class or a tuple of exception "
+                f"classes, got {retry_on!r}"
+            )
+    if len(exc_types) == 0:
+        raise ValueError("retry_on must contain at least one exception class")
+
+    validated = []
+    for exc_type in exc_types:
+        if not isinstance(exc_type, type) or not issubclass(
+            exc_type, Exception
+        ):
+            raise TypeError(
+                "retry_on only accepts importable subclasses of Exception, "
+                f"got {exc_type!r}"
+            )
+        module_name = getattr(exc_type, "__module__", None)
+        qualname = getattr(exc_type, "__qualname__", None)
+        if module_name is None or qualname is None or "<" in qualname:
+            raise ValueError(
+                f"retry_on exception {exc_type!r} is not importable: define "
+                "it at module level so it can be resolved by qualified name"
+            )
+        try:
+            module = importlib.import_module(module_name)
+            resolved = module
+            for attr in qualname.split("."):
+                resolved = getattr(resolved, attr)
+        except (ImportError, AttributeError) as e:
+            raise ValueError(
+                f"retry_on exception {exc_type!r} is not importable from "
+                f"{module_name!r}: {e}"
+            )
+        if resolved is not exc_type:
+            raise ValueError(
+                f"retry_on exception {exc_type!r} cannot be resolved by its "
+                f"qualified name {module_name}.{qualname}"
+            )
+        validated.append(exc_type)
+    return tuple(validated)
+
+
+class RetryPolicy:
+    """Immutable retry configuration for a ``submit_retry`` task.
+
+    Args:
+        retry_on: an exception class or a tuple of importable exception
+            classes. A failed attempt is retried only when the raised error is
+            an instance of one of these classes and of ``Exception``.
+        max_attempts: total number of attempts, including the first one. Must
+            be a positive integer.
+        initial_delay: delay in seconds waited before the second attempt.
+            Must be a non-negative number.
+        max_delay: upper bound in seconds for the exponential backoff. The
+            delay before attempt ``n + 1`` is
+            ``min(initial_delay * 2 ** (n - 1), max_delay)``. It must be larger
+            than or equal to ``initial_delay``.
+
+    Retries provide at-least-once execution semantics: the user function may
+    run more than once and callers must ensure repeating it is safe. There is
+    no exactly-once guarantee for tasks with external side effects.
+    """
+
+    __slots__ = ("retry_on", "max_attempts", "initial_delay", "max_delay")
+
+    def __init__(self, retry_on, max_attempts, initial_delay, max_delay):
+        self.retry_on = _validate_retryable_exceptions(retry_on)
+
+        if (
+            not isinstance(max_attempts, int)
+            or isinstance(max_attempts, bool)
+            or max_attempts < 1
+        ):
+            raise ValueError(
+                "max_attempts must be a positive integer, got "
+                f"{max_attempts!r}"
+            )
+        self.max_attempts = max_attempts
+
+        for name, value in (
+            ("initial_delay", initial_delay),
+            ("max_delay", max_delay),
+        ):
+            if (
+                not isinstance(value, (int, float))
+                or isinstance(value, bool)
+                or value < 0
+            ):
+                raise ValueError(
+                    f"{name} must be a non-negative number, got {value!r}"
+                )
+        if max_delay < initial_delay:
+            raise ValueError(
+                "max_delay must be greater than or equal to initial_delay, "
+                f"got {max_delay!r} < {initial_delay!r}"
+            )
+        self.initial_delay = float(initial_delay)
+        self.max_delay = float(max_delay)
+
+    def delay_for_next_attempt(self, attempts_done):
+        """Backoff delay after ``attempts_done`` attempts have been made."""
+        return min(
+            self.initial_delay * 2 ** (attempts_done - 1),
+            self.max_delay,
+        )
+
+
+class RetryFuture(Future):
+    """A :class:`~loky.Future` tracking the retry state of one task identity.
+
+    A single ``RetryFuture`` is shared by every attempt of the task, so user
+    completion callbacks are invoked only once and the future never returns to
+    the pending state while a retry is waiting for its backoff to elapse.
+    """
+
+    def __init__(self, retry_policy):
+        super().__init__()
+        self._retry_policy = retry_policy
+        self._attempt_count = 0
+
+    def _record_attempt(self):
+        # Only the executor manager thread calls this, so no lock is needed.
+        self._attempt_count += 1
+
+    @property
+    def retry_policy(self):
+        """The :class:`RetryPolicy` attached to this future."""
+        return self._retry_policy
+
+    @property
+    def attempt_count(self):
+        """Number of attempts dispatched so far (including the running one)."""
+        return self._attempt_count
 
 
 class _ResultItem:
-    def __init__(self, work_id, exception=None, result=None):
+    def __init__(
+        self, work_id, exception=None, result=None, serialization_error=False
+    ):
         self.work_id = work_id
         self.exception = exception
         self.result = result
+        # True when the exception was raised while sending the result back,
+        # i.e. after the user function successfully returned. Such errors are
+        # serialization failures and must never be retried.
+        self.serialization_error = serialization_error
 
 
 class _CallItem:
@@ -406,8 +589,13 @@ def _sendback_result(result_queue, work_id, result=None, exception=None):
             _ResultItem(work_id, result=result, exception=exception)
         )
     except BaseException as e:
+        # The user function itself completed: this failure happens while
+        # serializing its output. Flag it so the manager never retries the
+        # task, even when the caller allowed broad exception types.
         exc = _ExceptionWithTraceback(e)
-        result_queue.put(_ResultItem(work_id, exception=exc))
+        result_queue.put(
+            _ResultItem(work_id, exception=exc, serialization_error=True)
+        )
 
 
 def _enable_faulthandler_if_needed():
@@ -638,6 +826,18 @@ class _ExecutorManagerThread(threading.Thread):
         # A list of the work_ids that are currently running
         self.running_work_items = executor._running_work_items
 
+        # Monotonic clock used to schedule retry backoffs. It is an
+        # attribute of the executor so tests can drive the scheduling logic
+        # with a controllable clock instead of sleeping in real time.
+        self.clock = executor._clock
+
+        # Min-heap of ``(due_time, work_id)`` entries for retry work items
+        # that are waiting for their backoff to elapse. Those items stay in
+        # ``pending_work_items`` (and keep the same running Future) but are
+        # removed from ``running_work_items`` so the freed worker can process
+        # ordinary tasks while the backoff is pending.
+        self.scheduled_retries = []
+
         # A lock to avoid concurrent shutdown of workers on timeout and spawn
         # of new processes or shut down
         self.processes_management_lock = executor._processes_management_lock
@@ -712,6 +912,12 @@ class _ExecutorManagerThread(threading.Thread):
     def add_call_item_to_queue(self):
         # Fills call_queue with _WorkItems from pending_work_items.
         # This function never blocks.
+
+        # Retry items whose backoff has elapsed re-enter the call queue
+        # first, so that their finite retry budget keeps making progress even
+        # while the executor is shutting down.
+        self._dispatch_due_retry_items()
+
         while True:
             if self.call_queue.full():
                 return
@@ -723,19 +929,62 @@ class _ExecutorManagerThread(threading.Thread):
                 work_item = self.pending_work_items[work_id]
 
                 if work_item.future.set_running_or_notify_cancel():
-                    self.running_work_items += [work_id]
-                    self.call_queue.put(
-                        _CallItem(
-                            work_id,
-                            work_item.fn,
-                            work_item.args,
-                            work_item.kwargs,
-                        ),
-                        block=True,
-                    )
+                    self._dispatch_work_item(work_id, work_item)
                 else:
                     del self.pending_work_items[work_id]
                     continue
+
+    def _dispatch_work_item(self, work_id, work_item, is_reattempt=False):
+        # Rebuild the inputs from the stable serialized snapshot taken at
+        # submission time. Every attempt therefore starts from the exact same
+        # arguments and mutations performed by a previous attempt (in a
+        # worker) never carry over to the next one.
+        if is_reattempt and work_item.snapshot is not None:
+            fn, args, kwargs = loads(work_item.snapshot)
+            work_item.fn = fn
+            work_item.args = args
+            work_item.kwargs = kwargs
+
+        if isinstance(work_item.future, RetryFuture):
+            work_item.future._record_attempt()
+
+        self.running_work_items += [work_id]
+        self.call_queue.put(
+            _CallItem(
+                work_id,
+                work_item.fn,
+                work_item.args,
+                work_item.kwargs,
+            ),
+            block=True,
+        )
+
+    def _dispatch_due_retry_items(self):
+        now = self.clock()
+        while self.scheduled_retries:
+            due_time, work_id = self.scheduled_retries[0]
+            if due_time > now:
+                # The remaining entries all have a deadline at least as far
+                # in the future as this one.
+                return
+            if self.call_queue.full():
+                return
+            heapq.heappop(self.scheduled_retries)
+            work_item = self.pending_work_items.get(work_id)
+
+            # The entry may be stale if the task was cancelled, failed with a
+            # terminal error, killed on shutdown or the executor broke.
+            if (
+                work_item is None
+                or work_item.retry_policy is None
+                or work_id in self.running_work_items
+            ):
+                continue
+
+            # The Future already transitioned to RUNNING at the first
+            # dispatch: do not call set_running_or_notify_cancel() again, so
+            # it never briefly returns to PENDING during the backoff.
+            self._dispatch_work_item(work_id, work_item, is_reattempt=True)
 
     def wait_result_broken_or_wakeup(self):
         # Wait for a result to be ready in the result_queue while checking
@@ -747,7 +996,16 @@ class _ExecutorManagerThread(threading.Thread):
         wakeup_reader = self.thread_wakeup._reader
         readers = [result_reader, wakeup_reader]
         worker_sentinels = [p.sentinel for p in list(self.processes.values())]
-        ready = wait(readers + worker_sentinels)
+
+        # Bound the blocking wait by the backoff deadline of the nearest
+        # retry item, so due retries are re-queued on time without any
+        # worker-side sleeping or per-task timer thread. A new submission,
+        # shutdown or broken event still wakes us up immediately through the
+        # wakeup pipe.
+        timeout = None
+        if self.scheduled_retries:
+            timeout = max(0.0, self.scheduled_retries[0][0] - self.clock())
+        ready = wait(readers + worker_sentinels, timeout=timeout)
 
         bpe = None
         is_broken = True
@@ -774,9 +1032,11 @@ class _ExecutorManagerThread(threading.Thread):
                 )
                 bpe.__cause__ = _RemoteTraceback("".join(tb))
 
-        elif wakeup_reader in ready:
-            # This is simply a wake-up event that might either trigger putting
-            # more tasks in the queue or trigger the clean up of resources.
+        elif wakeup_reader in ready or not ready:
+            # A wake-up signal (new task, shutdown, gc, interpreter exit) or a
+            # plain timeout: the latter just means a retry backoff deadline
+            # was reached. The main loop re-evaluates the scheduled retry
+            # heap in both cases.
             is_broken = False
         else:
             # A worker has terminated and we don't know why, set the state of
@@ -876,15 +1136,77 @@ class _ExecutorManagerThread(threading.Thread):
                             UserWarning,
                         )
         else:
-            # Received a _ResultItem so mark the future as completed.
-            work_item = self.pending_work_items.pop(result_item.work_id, None)
+            # Received a _ResultItem so mark the future as completed, unless
+            # the failure is a retryable error of a submit_retry task that
+            # still has some retry budget left.
+            work_id = result_item.work_id
+            work_item = self.pending_work_items.get(work_id)
             # work_item can be None if another process terminated (see above)
-            if work_item is not None:
-                if result_item.exception is not None:
-                    work_item.future.set_exception(result_item.exception)
-                else:
-                    work_item.future.set_result(result_item.result)
-                self.running_work_items.remove(result_item.work_id)
+            if work_item is None:
+                return
+
+            if (
+                result_item.exception is not None
+                and self._schedule_retry_if_applicable(work_item, result_item)
+            ):
+                # The Future stays RUNNING and pending, with the same task
+                # identity: no result, exception or callback is propagated
+                # until a later attempt terminates the task. The worker is
+                # freed (running_work_items removal) and can serve ordinary
+                # tasks while the backoff elapses.
+                return
+
+            # Terminal completion: detach the work item and resolve the
+            # Future exactly once.
+            self.pending_work_items.pop(work_id, None)
+            if result_item.exception is not None:
+                work_item.future.set_exception(result_item.exception)
+            else:
+                work_item.future.set_result(result_item.result)
+            self.running_work_items.remove(work_id)
+
+    def _schedule_retry_if_applicable(self, work_item, result_item):
+        # Retries are only decided here, on a _ResultItem carrying an
+        # exception raised by the user function inside a worker. Every other
+        # failure mode bypasses this path and is therefore never retried:
+        # task/result pickling errors fail the Future directly from the queue
+        # feeder hook or are flagged below, unpickling failures, initializer
+        # failures and worker crashes flag the executor as broken, and
+        # BaseException-only errors are rejected by the isinstance(exc,
+        # Exception) check below. This also prevents retries from masking a
+        # broken pool.
+        policy = work_item.retry_policy
+        if policy is None:
+            return False
+
+        if getattr(result_item, "serialization_error", False):
+            # The user function returned but its result could not be sent
+            # back: re-executing it would not fix the serialization failure.
+            return False
+
+        exc = result_item.exception
+        if not isinstance(exc, Exception) or not isinstance(
+            exc, policy.retry_on
+        ):
+            return False
+
+        future = work_item.future
+        if future.attempt_count >= policy.max_attempts:
+            # Retry budget exhausted: the caller keeps the final exception,
+            # including its remote traceback, and can inspect attempt_count.
+            return False
+
+        delay = policy.delay_for_next_attempt(future.attempt_count)
+        due_time = self.clock() + delay
+        heapq.heappush(self.scheduled_retries, (due_time, result_item.work_id))
+        # The worker that just failed is now free to pick up other work.
+        self.running_work_items.remove(result_item.work_id)
+        mp.util.debug(
+            f"scheduling retry for work_id={result_item.work_id} in "
+            f"{delay:.3f}s (attempt {future.attempt_count}/"
+            f"{policy.max_attempts})"
+        )
+        return True
 
     def is_shutting_down(self):
         # Check whether we should start shutting down the executor.
@@ -908,15 +1230,20 @@ class _ExecutorManagerThread(threading.Thread):
         # Mark the process pool broken so that submits fail right now.
         self.executor_flags.flag_as_broken(bpe)
 
+        # Drop every backoff timer first: once the Futures below are failed,
+        # no scheduled retry must remain observable for the same task
+        # identity, and a broken pool must never be masked by a re-dispatch.
+        self.scheduled_retries.clear()
+
         # Mark pending tasks as failed.
         for work_item in self.pending_work_items.values():
             try:
                 work_item.future.set_exception(bpe)
             except InvalidStateError:
-                # set_exception() fails if the future is cancelled: ignore it.
-                # Trying to check if the future is cancelled before calling
-                # set_exception() would leave a race condition if the future is
-                # cancelled between the check and set_exception().
+                # set_exception() fails if the future is cancelled or already
+                # done: ignore it. Trying to check the state before calling
+                # set_exception() would leave a race condition if the future
+                # changed state between the check and the call.
                 pass
             # Delete references to object. See issue16284
             del work_item
@@ -943,14 +1270,25 @@ class _ExecutorManagerThread(threading.Thread):
                     self.work_ids_queue.get(block=False)
                 except queue.Empty:
                     break
+
+            # Remove the backoff timers first so tasks waiting for a retry
+            # cannot be re-dispatched once their Futures are failed.
+            self.scheduled_retries.clear()
+
             while self.pending_work_items:
                 _, work_item = self.pending_work_items.popitem()
-                work_item.future.set_exception(
-                    ShutdownExecutorError(
-                        "The Executor was shutdown with `kill_workers=True` "
-                        "before this job could complete."
+                try:
+                    work_item.future.set_exception(
+                        ShutdownExecutorError(
+                            "The Executor was shutdown with "
+                            "`kill_workers=True` before this job could "
+                            "complete."
+                        )
                     )
-                )
+                except InvalidStateError:
+                    # The task may have completed concurrently on the result
+                    # queue: a Future is completed at most once.
+                    pass
                 del work_item
 
             # Kill the remaining worker forcibly to no waste time joining them
@@ -1165,6 +1503,7 @@ class ProcessPoolExecutor(Executor):
         initializer=None,
         initargs=(),
         env=None,
+        clock=None,
     ):
         """Initializes a new ProcessPoolExecutor instance.
 
@@ -1189,6 +1528,10 @@ class ProcessPoolExecutor(Executor):
             env: A dict of environment variable to overwrite in the child
                 process. The environment variables are set before any module is
                 loaded. Note that this only works with the loky context.
+            clock: optional zero-argument callable returning a monotonic time,
+                used to schedule ``submit_retry`` backoffs. It defaults to
+                :func:`time.monotonic` and is mainly an injection point for
+                deterministic tests of the retry scheduling.
         """
         _check_system_limits()
 
@@ -1221,6 +1564,13 @@ class ProcessPoolExecutor(Executor):
 
         if result_reducers is None:
             result_reducers = job_reducers
+
+        # Keep the job reducers around so submit_retry can snapshot its
+        # arguments with the exact same pickler as the call queue.
+        self._job_reducers = job_reducers
+
+        # Monotonic clock driving the retry backoff scheduling.
+        self._clock = monotonic if clock is None else clock
 
         # Timeout
         self._timeout = timeout
@@ -1381,6 +1731,113 @@ class ProcessPoolExecutor(Executor):
             return f
 
     submit.__doc__ = Executor.submit.__doc__
+
+    def submit_retry(
+        self,
+        fn,
+        *args,
+        retry_on,
+        max_attempts,
+        initial_delay,
+        max_delay,
+        **kwargs,
+    ):
+        """Submit a callable for execution with bounded automatic retries.
+
+        The call is executed like an ordinary :meth:`submit` task, but when the
+        user function raises one of the explicitly allowed, importable
+        ``retry_on`` exceptions, the manager thread re-dispatches the same
+        task after an exponential backoff, up to ``max_attempts`` attempts in
+        total. Retries are scheduled by the parent process on a monotonic
+        clock: workers never sleep while a backoff is pending and no timer
+        thread is created per task.
+
+        Args:
+            fn: the callable to execute.
+            *args, **kwargs: positional and keyword arguments of ``fn``. They
+                are serialized into a stable snapshot when the task is
+                accepted; every attempt restores that snapshot, so mutations
+                performed by a previous attempt never carry over. If the
+                snapshot cannot be produced, this method raises before any
+                attempt is executed.
+            retry_on: an exception class or a tuple of importable exception
+                classes. Only instances of these types that are also regular
+                :class:`Exception` instances trigger a retry. Task and result
+                (de)serialization errors, initializer failures, worker crashes
+                and ``BaseException``-only errors are never retried, and a
+                broken pool is never masked by re-executing the task.
+            max_attempts: total number of attempts, including the first one.
+            initial_delay: backoff in seconds before the second attempt.
+            max_delay: upper bound in seconds of the exponential backoff. The
+                delay before attempt ``n + 1`` is
+                ``min(initial_delay * 2 ** (n - 1), max_delay)``.
+
+        Returns:
+            RetryFuture: a single future shared by every attempt. It can be
+                cancelled like a plain future before its first dispatch, while
+                ``cancel()`` returns ``False`` afterwards, including while a
+                backoff is pending. Its ``attempt_count`` attribute reports
+                how many attempts were dispatched. On success it holds the
+                last result; when the budget is exhausted it keeps the final
+                exception, including its remote traceback.
+
+        Retries only provide at-least-once semantics: the user function may
+        run more than once and callers must themselves ensure repeating it is
+        safe. There is no guarantee that external side effects happen exactly
+        once.
+        """
+        # Validate the configuration before touching any executor state: an
+        # invalid policy must raise to the caller without creating a future.
+        policy = RetryPolicy(
+            retry_on=retry_on,
+            max_attempts=max_attempts,
+            initial_delay=initial_delay,
+            max_delay=max_delay,
+        )
+
+        with self._flags.shutdown_lock:
+            if self._flags.broken is not None:
+                raise self._flags.broken
+            if self._flags.shutdown:
+                raise ShutdownExecutorError(
+                    "cannot schedule new futures after shutdown"
+                )
+
+            # Cannot submit a new calls once the interpreter is shutting down.
+            # This check avoids spawning new processes at exit.
+            if _global_shutdown:
+                raise RuntimeError(
+                    "cannot schedule new futures after interpreter shutdown"
+                )
+
+            # Build the stable serialized snapshot eagerly, with the same
+            # pickler and reducers as the call queue. A failure here aborts
+            # the submission before the first execution and leaves no trace
+            # in the executor queues. The round-trip also verifies the
+            # snapshot can be restored identically on every retry.
+            snapshot = bytes(
+                dumps((fn, args, kwargs), reducers=self._job_reducers)
+            )
+            fn, args, kwargs = loads(snapshot)
+
+            f = RetryFuture(policy)
+            w = _WorkItem(
+                f,
+                fn,
+                args,
+                kwargs,
+                retry_policy=policy,
+                snapshot=snapshot,
+            )
+
+            self._pending_work_items[self._queue_count] = w
+            self._work_ids.put(self._queue_count)
+            self._queue_count += 1
+            # Wake up queue management thread
+            self._executor_manager_thread_wakeup.wakeup()
+
+            self._ensure_executor_running()
+            return f
 
     def map(self, fn, *iterables, **kwargs):
         """Returns an iterator equivalent to map(fn, iter).

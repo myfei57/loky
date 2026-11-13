@@ -1,8 +1,17 @@
 ### 3.8.0 - In development
 
+- Add ``ProcessPoolExecutor.submit_retry`` to run a task with bounded,
+  exponential-backoff retries limited to explicitly given importable
+  exception types. All attempts share a single ``RetryFuture`` (and thus one
+  task identity and one completion callback), backoffs are scheduled by the
+  parent process on a monotonic clock, and the task arguments are captured in
+  a stable serialized snapshot at submission time. Plain ``submit`` keeps its
+  default no-retry behavior; serialization failures, broken pools, worker
+  crashes and ``BaseException`` errors are never retried.
+
 - Fix ``Popen._launch`` on POSIX raising ``UnboundLocalError`` instead of the
-  real ``OSError`` when ``os.pipe()`` fails, for instance when the parent process
-  runs out of file descriptors (``EMFILE``). (#668)
+  real ``OSError`` when ``os.pipe()`` fails, for instance when the parent
+  process runs out of file descriptors (``EMFILE``). (#668)
 
 ### 3.7.0 - 2026-09-29
 

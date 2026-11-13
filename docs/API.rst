@@ -9,6 +9,32 @@ API Reference
     :members:
     :class-doc-from: init
 
+.. autoclass:: RetryPolicy
+    :members:
+
+.. autoclass:: RetryFuture
+    :members:
+
+Retrying tasks
+--------------
+
+:meth:`ProcessPoolExecutor.submit_retry` submits a task that is automatically
+re-executed, up to a finite number of attempts, when the user function raises
+one of the explicitly allowed, importable exception types. The delay before
+each new attempt follows an exponential backoff bounded by ``max_delay``,
+computed on a monotonic clock in the parent process: workers never sleep and no
+per-task timer thread is created. Tasks waiting for their backoff keep the same
+:class:`RetryFuture` (and therefore the same task identity), free their worker
+for ordinary tasks, and cannot be cancelled or reported as done until a later
+attempt terminates them. Task arguments are captured in a stable serialized
+snapshot at submission time, so every attempt restores the same inputs.
+
+Retries provide at-least-once semantics only: a task may run more than once,
+and callers must ensure repeating it is safe. There is no exactly-once
+guarantee for tasks with external side effects. Serialization errors,
+deserialization failures, initializer failures, worker crashes,
+``BaseException``-only errors and a broken pool are never retried.
+
 
 Task & results serialization
 ----------------------------
