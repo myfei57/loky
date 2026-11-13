@@ -32,6 +32,7 @@ from loky.process_executor import (
     BrokenProcessPool,
     ShutdownExecutorError,
     TerminatedWorkerError,
+    _RemoteTraceback,
 )
 from loky._base import Future
 
@@ -1340,3 +1341,401 @@ def _custom_initializer():
     use cloudpickle to pickle the initializer.
     """
     loky._custom_global_var = 42
+
+
+# ---------------------------------------------------------------------------
+# Helpers for ProcessPoolExecutor.submit_stream tests. Defined at module
+# level so that every start method can pickle them. Cross-process observation
+# relies on files because multiprocessing synchronization primitives cannot
+# be shared through a queue at runtime (assert_spawning).
+# ---------------------------------------------------------------------------
+
+
+def _stream_range(n):
+    for i in range(n):
+        yield i
+    return "stream-return-value"
+
+
+def _stream_empty():
+    return
+    yield
+
+
+def _stream_tagged(tag, n):
+    for i in range(n):
+        yield tag, i
+
+
+def _stream_slow(n, delay):
+    for i in range(n):
+        time.sleep(delay)
+        yield i
+
+
+def _stream_fail_after(n):
+    for i in range(n):
+        yield i
+    raise RuntimeError("stream boom")
+
+
+class _UnpicklableStreamItem:
+    def __reduce__(self):
+        raise PicklingError("this stream item cannot be pickled")
+
+
+def _stream_with_unpicklable_item():
+    yield 0
+    yield _UnpicklableStreamItem()
+    yield 2  # pragma: no cover - must never be reached
+
+
+class _UnpicklableReturnValue:
+    def __reduce__(self):
+        raise PicklingError("the return value cannot be pickled")
+
+
+def _stream_with_unpicklable_return():
+    yield 1
+    return _UnpicklableReturnValue()
+
+
+def _stream_finally_marker(marker_path):
+    try:
+        for i in range(100):
+            yield i
+    finally:
+        with open(marker_path, "w") as f:
+            f.write("finally-ran")
+
+
+def _stream_count_nexts(counter_path, n, delay=0.0):
+    for i in range(n):
+        with open(counter_path, "a") as f:
+            f.write("x\n")
+            f.flush()
+        if delay:
+            time.sleep(delay)
+        yield i
+
+
+def _stream_crash_after_one():
+    yield 0
+    os._exit(0)
+
+
+def _stream_plain_generator():
+    yield "a"
+    yield "b"
+
+
+def _count_file_lines(path):
+    if not os.path.exists(path):
+        return 0
+    with open(path, "r") as f:
+        return sum(1 for _ in f)
+
+
+def _wait_for_path(path, timeout=_executor_mixin.TIMEOUT):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if os.path.exists(path):
+            return True
+        time.sleep(0.01)
+    return False
+
+
+class StreamExecutorTest:
+    """Functional tests for ProcessPoolExecutor.submit_stream."""
+
+    def test_stream_basic_iteration_and_return_value(self):
+        stream = self.executor.submit_stream(
+            _stream_range, 6, max_buffered_items=2
+        )
+        assert not stream.done
+        with pytest.raises(RuntimeError):
+            stream.return_value
+        items = list(stream)
+        assert items == [0, 1, 2, 3, 4, 5]
+        # The terminal message may lag the last item by a short instant.
+        assert stream.wait(_executor_mixin.TIMEOUT)
+        assert stream.done
+        assert stream.state == "complete"
+        assert stream.return_value == "stream-return-value"
+        assert stream.exception() is None
+        # Re-iterating a finished stream yields nothing.
+        assert list(stream) == []
+
+    def test_stream_empty_generator(self):
+        stream = self.executor.submit_stream(
+            _stream_empty, max_buffered_items=1
+        )
+        assert list(stream) == []
+        assert stream.wait(_executor_mixin.TIMEOUT)
+        assert stream.state == "complete"
+        assert stream.return_value is None
+        assert stream.exception() is None
+
+    def test_stream_backpressure_fast_producer_slow_consumer(self, tmp_path):
+        # Observable proof of backpressure: the worker-side ``next`` call
+        # count, mirrored into a file, can never exceed the number of items
+        # consumed plus the configured window.
+        window = 3
+        n_items = 15
+        counter_path = str(tmp_path / "next_counter.log")
+        stream = self.executor.submit_stream(
+            _stream_count_nexts,
+            counter_path,
+            n_items,
+            max_buffered_items=window,
+        )
+        consumed = 0
+        producer_ran_ahead = False
+        for item in stream:
+            consumed += 1
+            sample_deadline = time.time() + 0.08
+            while time.time() < sample_deadline:
+                produced = _count_file_lines(counter_path)
+                assert produced <= consumed + window
+                if produced > consumed:
+                    producer_ran_ahead = True
+                time.sleep(0.005)
+        assert consumed == n_items
+        assert _count_file_lines(counter_path) == n_items
+        # The producer must really have been allowed to run ahead within the
+        # window, otherwise the test would not distinguish windowed from
+        # fully synchronous delivery.
+        assert producer_ran_ahead
+        assert stream.wait(_executor_mixin.TIMEOUT)
+        assert stream.state == "complete"
+
+    def test_stream_window_one_strict_alternation(self, tmp_path):
+        counter_path = str(tmp_path / "window1_counter.log")
+        stream = self.executor.submit_stream(
+            _stream_count_nexts,
+            counter_path,
+            8,
+            max_buffered_items=1,
+        )
+        consumed = 0
+        for _ in stream:
+            consumed += 1
+            time.sleep(0.03)
+            # With a window of one, at most one item may be in flight.
+            assert _count_file_lines(counter_path) <= consumed + 1
+        assert consumed == 8
+        assert stream.wait(_executor_mixin.TIMEOUT)
+
+    def test_stream_two_streams_interleave_without_crossing(self):
+        stream_a = self.executor.submit_stream(
+            _stream_tagged, "a", 10, max_buffered_items=1
+        )
+        stream_b = self.executor.submit_stream(
+            _stream_tagged, "b", 10, max_buffered_items=1
+        )
+        received_a, received_b = [], []
+        for _ in range(10):
+            received_a.append(next(stream_a))
+            received_b.append(next(stream_b))
+        assert received_a == [("a", i) for i in range(10)]
+        assert received_b == [("b", i) for i in range(10)]
+        assert stream_a.wait(_executor_mixin.TIMEOUT)
+        assert stream_b.wait(_executor_mixin.TIMEOUT)
+        assert stream_a.state == stream_b.state == "complete"
+        # Sequence numbers are per-stream: items of stream b did not restart
+        # stream a's numbering, as the content itself demonstrates.
+
+    def test_stream_exception_reported_after_sent_items(self):
+        stream = self.executor.submit_stream(
+            _stream_fail_after, 3, max_buffered_items=1
+        )
+        received = []
+        with pytest.raises(RuntimeError, match="stream boom"):
+            for item in stream:
+                received.append(item)
+        # All previously sent items are delivered before the exception.
+        assert received == [0, 1, 2]
+        assert stream.wait(_executor_mixin.TIMEOUT)
+        assert stream.state == "error"
+        exception = stream.exception()
+        assert isinstance(exception, RuntimeError)
+        # The remote traceback is preserved as the exception cause.
+        assert isinstance(exception.__cause__, _RemoteTraceback)
+        remote_tb = str(exception.__cause__)
+        assert "Traceback" in remote_tb
+        assert "_stream_fail_after" in remote_tb
+        assert stream.return_value is None
+
+    def test_stream_unpicklable_item_fails_only_that_stream(self):
+        stream = self.executor.submit_stream(
+            _stream_with_unpicklable_item, max_buffered_items=1
+        )
+        received = []
+        with pytest.raises(PicklingError):
+            for item in stream:
+                received.append(item)
+        assert received == [0]
+        assert stream.wait(_executor_mixin.TIMEOUT)
+        assert stream.state == "error"
+        # The shared result channel and the executor stay usable.
+        assert self.executor._flags.broken is None
+        assert self.executor.submit(sum, [1, 2, 3]).result() == 6
+        other_stream = self.executor.submit_stream(
+            _stream_range, 4, max_buffered_items=1
+        )
+        assert list(other_stream) == [0, 1, 2, 3]
+        assert other_stream.state == "complete"
+
+    def test_stream_unpicklable_return_value_reports_error(self):
+        # A non-picklable generator return value must terminate the stream
+        # with an error instead of losing the terminal message and hanging.
+        stream = self.executor.submit_stream(
+            _stream_with_unpicklable_return, max_buffered_items=1
+        )
+        received = []
+        with pytest.raises(PicklingError):
+            for item in stream:
+                received.append(item)
+        assert received == [1]
+        assert stream.wait(_executor_mixin.TIMEOUT)
+        assert stream.state == "error"
+        assert self.executor._flags.broken is None
+
+    def test_stream_early_close_runs_finally_and_discards_items(
+        self, tmp_path
+    ):
+        marker_path = str(tmp_path / "finally.marker")
+        stream = self.executor.submit_stream(
+            _stream_finally_marker, marker_path, max_buffered_items=1
+        )
+        assert next(stream) == 0
+        stream.close()
+        # Idempotent: a second call is a no-op.
+        stream.close()
+        assert stream.wait(_executor_mixin.TIMEOUT)
+        assert stream.state == "closed"
+        # The generator ``finally`` clause ran inside the worker.
+        assert _wait_for_path(marker_path)
+        # Undelivered items have been discarded.
+        assert list(stream) == []
+        assert stream.exception() is None
+        # The worker that drove the stream is released and reusable.
+        assert self.executor.submit(int, "11").result() == 11
+
+    def test_stream_close_wakes_blocked_worker(self, tmp_path):
+        # With a full window the worker blocks waiting for an
+        # acknowledgement: close must wake it up without any consumption.
+        stream = self.executor.submit_stream(
+            _stream_slow, 50, 0.05, max_buffered_items=1
+        )
+        assert next(stream) == 0
+        stream.close()
+        assert stream.wait(_executor_mixin.TIMEOUT)
+        assert stream.state == "closed"
+
+    def test_stream_shutdown_without_consumption(self):
+        stream = self.executor.submit_stream(
+            _stream_slow, 50, 0.1, max_buffered_items=1
+        )
+        # Never iterate: the executor must still exit on its own by closing
+        # the open stream cooperatively.
+        start = time.time()
+        self.executor.shutdown(wait=True)
+        assert time.time() - start < 10
+        assert stream.done
+        assert stream.state == "closed"
+
+    @pytest.mark.broken_pool
+    def test_stream_worker_unexpected_exit(self):
+        stream = self.executor.submit_stream(
+            _stream_crash_after_one, max_buffered_items=1
+        )
+        with pytest.raises(TerminatedWorkerError):
+            list(stream)
+        assert stream.wait(_executor_mixin.TIMEOUT)
+        assert stream.state == "broken"
+        assert isinstance(stream.exception(), TerminatedWorkerError)
+
+    def test_stream_plain_submit_generator_behavior_unchanged(self):
+        # A generator function submitted through the regular submit keeps
+        # its historical behavior: the generator object cannot cross the
+        # process boundary and the future fails with a pickling error.
+        future = self.executor.submit(_stream_plain_generator)
+        with pytest.raises(TypeError, match="generator"):
+            future.result()
+        assert self.executor._flags.broken is None
+
+    def test_stream_single_consumer_enforcement(self):
+        stream = self.executor.submit_stream(
+            _stream_range, 5, max_buffered_items=1
+        )
+        assert next(stream) == 0
+        captured = {}
+
+        def foreign_consumer():
+            try:
+                next(stream)
+            except RuntimeError as exc:
+                captured["exc"] = exc
+
+        thread = threading.Thread(target=foreign_consumer)
+        thread.start()
+        thread.join()
+        assert isinstance(captured.get("exc"), RuntimeError)
+        # The owning thread can still consume the stream to completion.
+        assert list(stream) == [1, 2, 3, 4]
+        assert stream.wait(_executor_mixin.TIMEOUT)
+
+    def test_stream_invalid_max_buffered_items(self):
+        for invalid in (0, -1, 1.5, "2", None):
+            with pytest.raises(ValueError):
+                self.executor.submit_stream(
+                    _stream_range, 1, max_buffered_items=invalid
+                )
+
+    def test_stream_full_window_does_not_block_other_work(self):
+        # Occupy one worker with a full-window, unconsumed stream.
+        blocked = self.executor.submit_stream(
+            _stream_slow, 30, 0.2, max_buffered_items=1
+        )
+        assert next(blocked) == 0
+        # Regular result processing must remain responsive.
+        start = time.time()
+        assert self.executor.submit(pow, 2, 10).result() == 1024
+        assert time.time() - start < _executor_mixin.TIMEOUT
+        # Another stream stays fully consumable while the first is stalled.
+        other = self.executor.submit_stream(
+            _stream_range, 5, max_buffered_items=1
+        )
+        assert list(other) == [0, 1, 2, 3, 4]
+        blocked.close()
+        assert blocked.wait(_executor_mixin.TIMEOUT)
+
+    def test_stream_resources_are_released(self):
+        stream = self.executor.submit_stream(
+            _stream_range, 4, max_buffered_items=2
+        )
+        work_id = stream._work_id
+        assert list(stream) == [0, 1, 2, 3]
+        assert stream.wait(_executor_mixin.TIMEOUT)
+        # Parent-side control pipe end closed and bookkeeping removed.
+        assert stream._conn is None
+        assert work_id not in self.executor._pending_work_items
+        assert work_id not in self.executor._running_work_items
+        # The implementation creates no per-stream helper thread.
+        assert [
+            t for t in threading.enumerate() if "stream" in t.name.lower()
+        ] == []
+        # The executor itself remains healthy and responsive.
+        assert self.executor.submit(int, "3").result() == 3
+
+    def test_stream_wait_timeout_reports_pending_state(self):
+        stream = self.executor.submit_stream(
+            _stream_slow, 10, 0.05, max_buffered_items=1
+        )
+        assert stream.wait(0.01) is False
+        assert not stream.done
+        assert stream.state == "open"
+        stream.close()
+        assert stream.wait(_executor_mixin.TIMEOUT)
+        assert stream.done

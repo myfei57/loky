@@ -310,6 +310,105 @@ class _CallItem:
         )
 
 
+# ---------------------------------------------------------------------------
+# Streaming protocol (ProcessPoolExecutor.submit_stream)
+#
+# Worker -> parent messages travel on the shared result queue. Every message
+# carries the stream identity (``work_id``) and data messages additionally
+# carry a per-stream strictly monotonic sequence number, so messages of
+# interleaved streams can never be mixed up.
+#
+# Parent -> worker control messages (acknowledgements and close requests)
+# travel on a dedicated one-way pipe created per stream. A pipe per stream
+# lets a blocked worker wait on its own control channel without stealing
+# messages addressed to another stream.
+# ---------------------------------------------------------------------------
+
+# Control messages sent on the per-stream control pipe.
+_STREAM_ACK = "loky-stream-ack"
+_STREAM_CLOSE = "loky-stream-close"
+
+# Kinds of terminal stream messages.
+_STREAM_COMPLETE = "complete"
+_STREAM_CLOSED = "closed"
+
+
+class _StreamMessage:
+    """Base class for the worker -> parent messages of a stream."""
+
+    __slots__ = ("work_id",)
+
+    def __init__(self, work_id):
+        self.work_id = work_id
+
+
+class _StreamItem(_StreamMessage):
+    """A single item yielded by the worker-side generator."""
+
+    __slots__ = ("seq", "item")
+
+    def __init__(self, work_id, seq, item):
+        self.work_id = work_id
+        self.seq = seq
+        self.item = item
+
+
+class _StreamEnd(_StreamMessage):
+    """Terminal message: the generator completed or was closed cooperatively."""
+
+    __slots__ = ("kind", "result")
+
+    def __init__(self, work_id, kind, result=None):
+        self.work_id = work_id
+        self.kind = kind
+        self.result = result
+
+
+class _StreamError(_StreamMessage):
+    """Terminal message: the generator or the serialization of an item failed."""
+
+    __slots__ = ("exception",)
+
+    def __init__(self, work_id, exception):
+        self.work_id = work_id
+        self.exception = exception
+
+
+class _StreamCallItem(_CallItem):
+    """A call item asking a worker to drive a streaming generator."""
+
+    __slots__ = ("max_buffered_items", "stream_conn")
+
+    def __init__(
+        self, work_id, fn, args, kwargs, max_buffered_items, stream_conn
+    ):
+        super().__init__(work_id, fn, args, kwargs)
+        # Size of the backpressure window: the worker may have at most this
+        # many yielded items waiting to be consumed by the parent process.
+        self.max_buffered_items = max_buffered_items
+        # Read end of the per-stream control pipe (ack / close messages).
+        self.stream_conn = stream_conn
+
+
+class _StreamWorkItem(_WorkItem):
+    """Parent-side bookkeeping for a submitted stream."""
+
+    __slots__ = ("stream", "max_buffered_items", "stream_conn")
+
+    def __init__(
+        self, stream, fn, args, kwargs, max_buffered_items, stream_conn
+    ):
+        # The ``future`` slot of a regular work item is replaced by the
+        # StreamResult, which exposes the stream state to the caller.
+        super().__init__(stream, fn, args, kwargs)
+        self.stream = stream
+        self.max_buffered_items = max_buffered_items
+        # Parent-side read end of the control pipe. It is kept open until the
+        # stream terminates so that the call queue feeder thread can safely
+        # duplicate it into the worker; it is then closed deterministically.
+        self.stream_conn = stream_conn
+
+
 class _SafeQueue(Queue):
     """Safe Queue set exception to the future object linked to a job"""
 
@@ -371,7 +470,17 @@ class _SafeQueue(Queue):
             )
             self.executor_flags.flag_as_broken(raised_error)
         if work_item is not None:
-            work_item.future.set_exception(raised_error)
+            if isinstance(work_item, _StreamWorkItem):
+                # A stream that could not even be sent to a worker fails on
+                # its own, without involving any future.
+                work_item.stream._fail(raised_error)
+                if work_item.stream_conn is not None:
+                    try:
+                        work_item.stream_conn.close()
+                    except OSError:
+                        pass
+            else:
+                work_item.future.set_exception(raised_error)
             del work_item
         with self.shutdown_lock:
             self.thread_wakeup.wakeup()
@@ -408,6 +517,184 @@ def _sendback_result(result_queue, work_id, result=None, exception=None):
     except BaseException as e:
         exc = _ExceptionWithTraceback(e)
         result_queue.put(_ResultItem(work_id, exception=exc))
+
+
+def _safe_stream_exception(exc):
+    """Build a picklable exception-with-traceback for a failing stream.
+
+    Falls back to a plain ``RuntimeError`` if the original exception cannot
+    itself be serialized, so that a terminal message can always be sent.
+    """
+    try:
+        return _ExceptionWithTraceback(exc)
+    except BaseException:
+        fallback = RuntimeError(
+            f"Stream failed with a non-picklable "
+            f"{type(exc).__name__}: {exc}"
+        )
+        return _ExceptionWithTraceback(fallback)
+
+
+def _run_stream_call(call_item, result_queue):
+    """Drive a streaming generator inside a worker process.
+
+    The generator is advanced one ``next`` at a time. Each yielded item is
+    sent individually on the shared result queue wrapped in a ``_StreamItem``
+    carrying the stream identity and a monotonic sequence number. The worker
+    only advances the generator while fewer than ``max_buffered_items`` items
+    are waiting for acknowledgement from the consumer: once the window is
+    full it blocks on the per-stream control pipe until an acknowledgement or
+    a close request arrives.
+
+    A close request is honoured at the next cooperative yield boundary by
+    calling ``generator.close()``, letting ``finally`` clauses run; items not
+    delivered yet are discarded.
+    """
+    work_id = call_item.work_id
+    conn = call_item.stream_conn
+    window = call_item.max_buffered_items
+
+    in_flight = 0
+    seq = 0
+    closing = False
+    terminal_sent = False
+
+    def send_terminal(message):
+        # A terminal message must reach the parent whenever the worker is
+        # still able to write to the result channel. Return whether it was
+        # actually sent: callers need a picklable fallback when the preferred
+        # terminal message cannot itself be serialized. If sending any
+        # terminal fails, the parent's worker-exit detection still recovers
+        # the stream as a last resort.
+        nonlocal terminal_sent
+        try:
+            result_queue.put(message)
+            terminal_sent = True
+            return True
+        except BaseException:
+            return False
+
+    def drain_control():
+        # Consume every pending acknowledgement / close request without
+        # blocking. Returns False if the control pipe is broken.
+        nonlocal in_flight, closing
+        while conn.poll():
+            try:
+                message = conn.recv()
+            except (EOFError, OSError):
+                closing = True
+                return False
+            if message == _STREAM_CLOSE:
+                closing = True
+            else:
+                in_flight -= 1
+        return True
+
+    try:
+        try:
+            generator = call_item()
+        except BaseException as e:
+            send_terminal(_StreamError(work_id, _safe_stream_exception(e)))
+            return
+        try:
+            while True:
+                # Pick up acknowledgements / close requests accumulated while
+                # the generator was producing its previous item.
+                if not drain_control():
+                    break
+                if closing:
+                    break
+
+                if in_flight >= window:
+                    # Backpressure: wait for the consumer to take an item (or
+                    # for a close request) before advancing the generator.
+                    try:
+                        message = conn.recv()
+                    except (EOFError, OSError):
+                        closing = True
+                        break
+                    if message == _STREAM_CLOSE:
+                        closing = True
+                        break
+                    in_flight -= 1
+                    continue
+
+                try:
+                    item = next(generator)
+                except StopIteration as e:
+                    try:
+                        # The generator return value travels on the terminal
+                        # message. Attempt it directly so that a non-picklable
+                        # return value can be reported as a stream error
+                        # instead of silently dropping the terminal message.
+                        result_queue.put(
+                            _StreamEnd(work_id, _STREAM_COMPLETE, e.value)
+                        )
+                        terminal_sent = True
+                    except BaseException as send_error:
+                        send_terminal(
+                            _StreamError(
+                                work_id,
+                                _safe_stream_exception(send_error),
+                            )
+                        )
+                    return
+                except BaseException as e:
+                    # The generator raised: report the failure after the
+                    # items already sent, keeping the remote traceback.
+                    send_terminal(
+                        _StreamError(work_id, _safe_stream_exception(e))
+                    )
+                    return
+
+                # A close request may have arrived while ``next`` was running
+                # in user code. It cannot interrupt that call, but is handled
+                # at this cooperative boundary before sending the new item.
+                if not drain_control() or closing:
+                    break
+
+                try:
+                    # SimpleQueue serializes the message before writing any
+                    # byte to the pipe: if the item cannot be pickled, the
+                    # shared result channel is left untouched and the failure
+                    # only terminates this stream.
+                    result_queue.put(_StreamItem(work_id, seq, item))
+                except BaseException as e:
+                    send_terminal(
+                        _StreamError(work_id, _safe_stream_exception(e))
+                    )
+                    return
+                seq += 1
+                in_flight += 1
+        finally:
+            if closing:
+                # Cooperative close at a yield boundary: throw GeneratorExit
+                # into the generator so that its ``finally`` clauses run, then
+                # discard every undelivered item and release the resources.
+                try:
+                    generator.close()
+                except BaseException as e:
+                    if not terminal_sent:
+                        send_terminal(
+                            _StreamError(work_id, _safe_stream_exception(e))
+                        )
+                else:
+                    if not terminal_sent:
+                        send_terminal(
+                            _StreamEnd(work_id, _STREAM_CLOSED, None)
+                        )
+            elif not terminal_sent:
+                # Control pipe broken while the parent is gone: make sure the
+                # generator is still finalized even without a consumer.
+                try:
+                    generator.close()
+                except BaseException:
+                    pass
+    finally:
+        try:
+            conn.close()
+        except OSError:
+            pass
 
 
 def _enable_faulthandler_if_needed():
@@ -518,14 +805,19 @@ def _process_worker(
             else:
                 mp.util.info("Main process did not release worker_exit")
             return
-        try:
-            r = call_item()
-        except BaseException as e:
-            exc = _ExceptionWithTraceback(e)
-            result_queue.put(_ResultItem(call_item.work_id, exception=exc))
+        if isinstance(call_item, _StreamCallItem):
+            # Streaming calls send their own _StreamItem / terminal messages
+            # on the result queue and apply backpressure internally.
+            _run_stream_call(call_item, result_queue)
         else:
-            _sendback_result(result_queue, call_item.work_id, result=r)
-            del r
+            try:
+                r = call_item()
+            except BaseException as e:
+                exc = _ExceptionWithTraceback(e)
+                result_queue.put(_ResultItem(call_item.work_id, exception=exc))
+            else:
+                _sendback_result(result_queue, call_item.work_id, result=r)
+                del r
 
         # Free the resource as soon as possible, to avoid holding onto
         # open files or shared memory that is not needed anymore
@@ -722,7 +1014,22 @@ class _ExecutorManagerThread(threading.Thread):
             else:
                 work_item = self.pending_work_items[work_id]
 
-                if work_item.future.set_running_or_notify_cancel():
+                if isinstance(work_item, _StreamWorkItem):
+                    # Streams cannot be cancelled: always dispatch them,
+                    # carrying the per-stream control pipe end and window.
+                    self.running_work_items += [work_id]
+                    self.call_queue.put(
+                        _StreamCallItem(
+                            work_id,
+                            work_item.fn,
+                            work_item.args,
+                            work_item.kwargs,
+                            work_item.max_buffered_items,
+                            work_item.stream_conn,
+                        ),
+                        block=True,
+                    )
+                elif work_item.future.set_running_or_notify_cancel():
                     self.running_work_items += [work_id]
                     self.call_queue.put(
                         _CallItem(
@@ -818,7 +1125,11 @@ class _ExecutorManagerThread(threading.Thread):
 
     def process_result_item(self, result_item):
         # Process the received a result_item. This can be either the PID of a
-        # worker that exited gracefully or a _ResultItem
+        # worker that exited gracefully, a _ResultItem or a stream message.
+
+        if isinstance(result_item, _StreamMessage):
+            self._process_stream_message(result_item)
+            return
 
         if isinstance(result_item, int):
             # Clean shutdown of a worker using its PID, either on request
@@ -886,6 +1197,64 @@ class _ExecutorManagerThread(threading.Thread):
                     work_item.future.set_result(result_item.result)
                 self.running_work_items.remove(result_item.work_id)
 
+    def _finish_stream_work_item(self, work_id):
+        # Remove a terminated stream from the bookkeeping structures and
+        # release the parent-side end of its control pipe.
+        work_item = self.pending_work_items.pop(work_id, None)
+        if work_item is not None:
+            if work_item.stream_conn is not None:
+                try:
+                    work_item.stream_conn.close()
+                except OSError:
+                    pass
+        try:
+            self.running_work_items.remove(work_id)
+        except ValueError:
+            pass
+
+    def _process_stream_message(self, message):
+        # Route a worker -> parent stream message to its StreamResult. The
+        # manager thread never blocks here: a full stream buffer is made
+        # impossible by the worker-side backpressure.
+        work_item = self.pending_work_items.get(message.work_id)
+        # The stream may already have been failed by a broken-pool shutdown.
+        if work_item is None:
+            return
+        stream = work_item.stream
+
+        if isinstance(message, _StreamItem):
+            try:
+                stream._deliver_item(message.seq, message.item)
+            except queue.Full:
+                # Cannot happen under the backpressure protocol: fail the
+                # stream instead of stalling the whole manager thread.
+                self._finish_stream_work_item(message.work_id)
+                stream._fail(
+                    RuntimeError(
+                        "loky internal error: stream buffer is full while "
+                        "the worker is still producing items"
+                    )
+                )
+            return
+
+        # Clean up the bookkeeping first so that, by the time the stream is
+        # marked done and consumers are woken up, no stale running/pending
+        # entry can be observed.
+        self._finish_stream_work_item(message.work_id)
+        if isinstance(message, _StreamEnd):
+            if message.kind == _STREAM_COMPLETE:
+                stream._finish(
+                    StreamResult.COMPLETE,
+                    return_value=message.result,
+                )
+            else:
+                # Cooperative close: undelivered items are discarded.
+                stream._finish(StreamResult.CLOSED, discard=True)
+        else:
+            # Generator or item-serialization failure: keep the items already
+            # delivered so the consumer drains them before the exception.
+            stream._finish(StreamResult.ERROR, exception=message.exception)
+
     def is_shutting_down(self):
         # Check whether we should start shutting down the executor.
         executor = self.executor_reference()
@@ -909,15 +1278,26 @@ class _ExecutorManagerThread(threading.Thread):
         self.executor_flags.flag_as_broken(bpe)
 
         # Mark pending tasks as failed.
-        for work_item in self.pending_work_items.values():
-            try:
-                work_item.future.set_exception(bpe)
-            except InvalidStateError:
-                # set_exception() fails if the future is cancelled: ignore it.
-                # Trying to check if the future is cancelled before calling
-                # set_exception() would leave a race condition if the future is
-                # cancelled between the check and set_exception().
-                pass
+        for work_item in list(self.pending_work_items.values()):
+            if isinstance(work_item, _StreamWorkItem):
+                # Wake up any stream consumer with the broken-pool error and
+                # release its control pipe.
+                work_item.stream._fail(bpe)
+                if work_item.stream_conn is not None:
+                    try:
+                        work_item.stream_conn.close()
+                    except OSError:
+                        pass
+            else:
+                try:
+                    work_item.future.set_exception(bpe)
+                except InvalidStateError:
+                    # set_exception() fails if the future is cancelled:
+                    # ignore it. Trying to check if the future is cancelled
+                    # before calling set_exception() would leave a race
+                    # condition if the future is cancelled between the check
+                    # and set_exception().
+                    pass
             # Delete references to object. See issue16284
             del work_item
         self.pending_work_items.clear()
@@ -934,27 +1314,44 @@ class _ExecutorManagerThread(threading.Thread):
         # requested as early as possible if it is not gc-ed yet.
         self.executor_flags.flag_as_shutting_down()
 
-        # Cancel pending work items if requested.
-        if self.executor_flags.kill_workers:
-            # Drain the queued ids first: add_call_item_to_queue runs again
-            # right after this and looks each of them up in pending_work_items
-            while True:
-                try:
-                    self.work_ids_queue.get(block=False)
-                except queue.Empty:
-                    break
-            while self.pending_work_items:
-                _, work_item = self.pending_work_items.popitem()
-                work_item.future.set_exception(
-                    ShutdownExecutorError(
-                        "The Executor was shutdown with `kill_workers=True` "
-                        "before this job could complete."
-                    )
-                )
-                del work_item
+        # Cooperative shutdown: ask every still-open stream to close. The
+        # workers finalize their generators at the next yield boundary and
+        # send their terminal message, so the executor can shut down without
+        # requiring the callers to keep consuming the streams. close() is
+        # idempotent so running this on every manager loop is harmless.
+        if not self.executor_flags.kill_workers:
+            for work_item in list(self.pending_work_items.values()):
+                if isinstance(work_item, _StreamWorkItem):
+                    work_item.stream.close()
+            return
 
-            # Kill the remaining worker forcibly to no waste time joining them
-            self.kill_workers(reason="executor shutting down")
+        # Cancel pending work items if requested.
+        # Drain the queued ids first: add_call_item_to_queue runs again
+        # right after this and looks each of them up in pending_work_items
+        while True:
+            try:
+                self.work_ids_queue.get(block=False)
+            except queue.Empty:
+                break
+        shutdown_error = ShutdownExecutorError(
+            "The Executor was shutdown with `kill_workers=True` "
+            "before this job could complete."
+        )
+        while self.pending_work_items:
+            _, work_item = self.pending_work_items.popitem()
+            if isinstance(work_item, _StreamWorkItem):
+                work_item.stream._fail(shutdown_error)
+                if work_item.stream_conn is not None:
+                    try:
+                        work_item.stream_conn.close()
+                    except OSError:
+                        pass
+            else:
+                work_item.future.set_exception(shutdown_error)
+            del work_item
+
+        # Kill the remaining worker forcibly to no waste time joining them
+        self.kill_workers(reason="executor shutting down")
 
     def kill_workers(self, reason=""):
         # Terminate the remaining workers using SIGKILL. This function also
@@ -1149,6 +1546,213 @@ class ShutdownExecutorError(RuntimeError):
     Raised when a ProcessPoolExecutor is shutdown while a future was in the
     running or pending state.
     """
+
+
+class StreamResult:
+    """Handle of a streaming task submitted with ``submit_stream``.
+
+    A ``StreamResult`` is a synchronous, single-consumer iterator over the
+    items yielded by the generator running in the worker process. Items are
+    delivered as soon as they are produced, without waiting for the generator
+    to finish. It additionally supports an explicit :meth:`close` and exposes
+    the final state of the stream once it has terminated.
+
+    The parent-side buffer is bounded by ``max_buffered_items``: the worker
+    can only get that many yielded items ahead of the consumer and blocks on
+    backpressure acknowledgements beyond this window.
+    """
+
+    # Stream states.
+    OPEN = "open"
+    COMPLETE = "complete"
+    CLOSED = "closed"
+    ERROR = "error"
+    BROKEN = "broken"
+
+    def __init__(self, work_id, conn, max_buffered_items):
+        self._work_id = work_id
+        # Write end of the per-stream control pipe. ``None`` once closed.
+        self._conn = conn
+        self._io_lock = threading.Lock()
+        self._cond = threading.Condition()
+        # Bounded parent-side buffer of ``(seq, item)`` tuples. Its capacity
+        # matches the worker backpressure window, so it can never fill beyond
+        # capacity as long as one acknowledgement is sent per retrieved item.
+        self._buffer = queue.Queue(maxsize=max_buffered_items)
+        self._consumer_thread = None
+        self._close_requested = False
+        self._done = False
+        self._state = self.OPEN
+        self._return_value = None
+        self._exception = None
+
+    # ------------------------------------------------------------------
+    # Consumer-facing API
+    # ------------------------------------------------------------------
+    def __iter__(self):
+        self._register_consumer()
+        return self
+
+    def __next__(self):
+        self._register_consumer()
+        with self._cond:
+            while self._buffer.empty() and not self._done:
+                self._cond.wait()
+            if not self._buffer.empty():
+                _seq, item = self._buffer.get_nowait()
+            else:
+                # Terminal state with nothing left to deliver. Errors are
+                # raised only after every previously sent item has been
+                # consumed.
+                if self._exception is not None:
+                    raise self._exception
+                raise StopIteration
+        # Acknowledge consumption to release one backpressure slot in the
+        # worker. This is done outside the condition lock.
+        self._send_control(_STREAM_ACK)
+        return item
+
+    def close(self):
+        """Request the worker to stop the stream cooperatively.
+
+        The request wakes up a worker blocked on backpressure and, at the
+        next yield boundary, calls ``close`` on the remote generator so that
+        its ``finally`` clauses run. Items not yet delivered are discarded.
+        Calling :meth:`close` does not interrupt a generator currently
+        executing inside a ``next`` call; it is honoured when that call
+        returns. This method is idempotent and thread-safe.
+        """
+        with self._io_lock:
+            if self._close_requested:
+                return
+            self._close_requested = True
+            self._send_control_locked(_STREAM_CLOSE)
+
+    def wait(self, timeout=None):
+        """Block until the stream reaches a terminal state.
+
+        Returns ``True`` if the stream is done and ``False`` if the timeout
+        expired first.
+        """
+        with self._cond:
+            if not self._done:
+                self._cond.wait(timeout)
+            return self._done
+
+    @property
+    def done(self):
+        """Whether the stream has reached a terminal state."""
+        with self._cond:
+            return self._done
+
+    @property
+    def state(self):
+        """Current stream state.
+
+        One of ``"open"``, ``"complete"``, ``"closed"``, ``"error"`` or
+        ``"broken"``.
+        """
+        with self._cond:
+            return self._state
+
+    @property
+    def return_value(self):
+        """The generator return value, available once the stream is done.
+
+        Raises :class:`RuntimeError` if the stream is still running. Returns
+        ``None`` when the stream was closed or failed.
+        """
+        with self._cond:
+            if not self._done:
+                raise RuntimeError(
+                    "the stream has not completed yet; call wait() or "
+                    "consume it before reading its return value"
+                )
+            return self._return_value
+
+    def exception(self):
+        """Return the exception that terminated the stream, if any.
+
+        Raises :class:`RuntimeError` if the stream is still running. Returns
+        ``None`` for a completed or cooperatively closed stream.
+        """
+        with self._cond:
+            if not self._done:
+                raise RuntimeError(
+                    "the stream has not completed yet; call wait() or "
+                    "consume it before reading its exception"
+                )
+            return self._exception
+
+    # ------------------------------------------------------------------
+    # Manager-thread API (not part of the public surface)
+    # ------------------------------------------------------------------
+    def _register_consumer(self):
+        with self._cond:
+            ident = threading.get_ident()
+            if self._consumer_thread is None:
+                self._consumer_thread = ident
+            elif self._consumer_thread != ident:
+                raise RuntimeError(
+                    "a StreamResult supports a single consumer; it is "
+                    "already being iterated from another thread"
+                )
+
+    def _send_control_locked(self, message):
+        if self._conn is None:
+            return
+        try:
+            self._conn.send(message)
+        except (BrokenPipeError, EOFError, OSError):
+            # The worker is gone or already shutting down: nothing to do,
+            # worker-exit detection or the terminal message will settle it.
+            pass
+
+    def _send_control(self, message):
+        with self._io_lock:
+            self._send_control_locked(message)
+
+    def _close_control_conn(self):
+        with self._io_lock:
+            if self._conn is not None:
+                try:
+                    self._conn.close()
+                except OSError:
+                    pass
+                self._conn = None
+
+    def _deliver_item(self, seq, item):
+        # Backpressure guarantees a free slot: every unacknowledged item is
+        # either in flight on the result pipe or held in this buffer, and the
+        # worker stops producing once their number reaches the buffer size.
+        # This therefore never blocks the executor manager thread.
+        self._buffer.put_nowait((seq, item))
+        with self._cond:
+            self._cond.notify_all()
+
+    def _finish(self, state, return_value=None, exception=None, discard=False):
+        self._close_control_conn()
+        with self._cond:
+            if self._done:
+                return
+            self._done = True
+            self._state = state
+            self._return_value = return_value
+            self._exception = exception
+            if discard:
+                # Cooperative close or broken pool: drop undelivered items so
+                # that the consumer is released immediately.
+                while not self._buffer.empty():
+                    try:
+                        self._buffer.get_nowait()
+                    except queue.Empty:
+                        break
+            self._cond.notify_all()
+
+    def _fail(self, exception):
+        # Used when the executor itself is broken, a shutdown with
+        # kill_workers is requested, or the stream could not be dispatched.
+        self._finish(self.BROKEN, exception=exception, discard=True)
 
 
 class ProcessPoolExecutor(Executor):
@@ -1381,6 +1985,77 @@ class ProcessPoolExecutor(Executor):
             return f
 
     submit.__doc__ = Executor.submit.__doc__
+
+    def submit_stream(self, fn, *args, max_buffered_items=1, **kwargs):
+        """Run a generator function in a worker and stream its yielded items.
+
+        Contrary to :meth:`submit`, which only delivers the final object
+        returned by the worker, ``fn`` must be a generator function and each
+        value it ``yield``\\ s is delivered to the returned
+        :class:`StreamResult` as soon as it is produced, without waiting for
+        the generator to finish.
+
+        Args:
+            fn: A generator function (a callable whose result is a generator
+                when called with ``fn(*args, **kwargs)``).
+            *args: Positional arguments forwarded to ``fn``.
+            max_buffered_items: Positive integer bounding the number of
+                yielded items that may be waiting for the consumer at any
+                time (the backpressure window). The worker only advances the
+                generator past this window once the consumer acknowledges the
+                retrieved items. It also bounds the parent-side buffer.
+            **kwargs: Keyword arguments forwarded to ``fn``.
+
+        Returns:
+            StreamResult: a synchronous, single-consumer iterable yielding
+            the items produced by the remote generator, supporting explicit
+            :meth:`~StreamResult.close` and exposing the final state of the
+            stream (generator return value or remote exception).
+        """
+        if not isinstance(max_buffered_items, int) or max_buffered_items <= 0:
+            raise ValueError(
+                "max_buffered_items must be a positive integer, got "
+                f"{max_buffered_items!r}"
+            )
+        with self._flags.shutdown_lock:
+            if self._flags.broken is not None:
+                raise self._flags.broken
+            if self._flags.shutdown:
+                raise ShutdownExecutorError(
+                    "cannot schedule new streams after shutdown"
+                )
+
+            # Cannot submit a new call once the interpreter is shutting down.
+            # This check avoids spawning new processes at exit.
+            if _global_shutdown:
+                raise RuntimeError(
+                    "cannot schedule new streams after interpreter shutdown"
+                )
+
+            # Per-stream one-way control pipe. The worker receives the read
+            # end through the call queue; the parent keeps the write end to
+            # send consumption acknowledgements and close requests.
+            worker_conn, parent_conn = self._context.Pipe(duplex=False)
+            stream = StreamResult(
+                self._queue_count, parent_conn, max_buffered_items
+            )
+            work_item = _StreamWorkItem(
+                stream,
+                fn,
+                args,
+                kwargs,
+                max_buffered_items,
+                worker_conn,
+            )
+
+            self._pending_work_items[self._queue_count] = work_item
+            self._work_ids.put(self._queue_count)
+            self._queue_count += 1
+            # Wake up queue management thread
+            self._executor_manager_thread_wakeup.wakeup()
+
+            self._ensure_executor_running()
+            return stream
 
     def map(self, fn, *iterables, **kwargs):
         """Returns an iterator equivalent to map(fn, iter).

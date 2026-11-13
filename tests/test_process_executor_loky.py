@@ -6,6 +6,7 @@ from ._test_process_executor import (
     AsCompletedTests,
     ExecutorShutdownTest,
     ExecutorTest,
+    StreamExecutorTest,
     WaitTests,
 )
 
@@ -30,4 +31,8 @@ class TestsProcessPoolLokyAsCompleted(ProcessPoolLokyMixin, AsCompletedTests):
 
 
 class TestsProcessPoolLokyExecutor(ProcessPoolLokyMixin, ExecutorTest):
+    pass
+
+
+class TestsProcessPoolLokyStream(ProcessPoolLokyMixin, StreamExecutorTest):
     pass

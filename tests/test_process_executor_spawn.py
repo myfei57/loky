@@ -7,6 +7,7 @@ from ._test_process_executor import (
     AsCompletedTests,
     ExecutorShutdownTest,
     ExecutorTest,
+    StreamExecutorTest,
     WaitTests,
 )
 
@@ -34,4 +35,8 @@ class TestsProcessPoolSpawnAsCompleted(
 
 
 class TestsProcessPoolSpawnExecutor(ProcessPoolSpawnMixin, ExecutorTest):
+    pass
+
+
+class TestsProcessPoolSpawnStream(ProcessPoolSpawnMixin, StreamExecutorTest):
     pass

@@ -1,5 +1,13 @@
 ### 3.8.0 - In development
 
+- Add ``ProcessPoolExecutor.submit_stream`` to run a generator function in a
+  worker and deliver each yielded item, as soon as it is produced, to a
+  single-consumer ``StreamResult``. Streams support synchronous iteration,
+  explicit ``close``, per-item backpressure bounded by a positive
+  ``max_buffered_items`` window, the generator return value in the final
+  stream state and remote tracebacks for generator or serialization errors,
+  without changing the behavior of the regular ``submit``.
+
 - Fix ``Popen._launch`` on POSIX raising ``UnboundLocalError`` instead of the
   real ``OSError`` when ``os.pipe()`` fails, for instance when the parent process
   runs out of file descriptors (``EMFILE``). (#668)

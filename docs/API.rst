@@ -9,6 +9,9 @@ API Reference
     :members:
     :class-doc-from: init
 
+.. autoclass:: loky.StreamResult
+    :members:
+
 
 Task & results serialization
 ----------------------------

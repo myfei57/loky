@@ -11,6 +11,7 @@ if sys.platform != "win32":
         AsCompletedTests,
         ExecutorShutdownTest,
         ExecutorTest,
+        StreamExecutorTest,
         WaitTests,
     )
 
@@ -36,5 +37,10 @@ if sys.platform != "win32":
 
     class TestsProcessPoolForkserverExecutor(
         ProcessPoolForkserverMixin, ExecutorTest
+    ):
+        pass
+
+    class TestsProcessPoolForkserverStream(
+        ProcessPoolForkserverMixin, StreamExecutorTest
     ):
         pass
