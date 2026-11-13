@@ -1,5 +1,17 @@
 ### 3.8.0 - In development
 
+- Add an executor-level ``context_bindings`` parameter to
+  ``ProcessPoolExecutor`` and ``get_reusable_executor`` to propagate selected
+  :class:`contextvars.ContextVar` values from the submitting thread to the
+  workers. Bindings map logical names to explicit
+  ``"module.path:attribute"`` paths: their values are captured at
+  ``submit`` time, each task runs in an isolated ``Context`` where the
+  variables are resolved from the same module attributes, unregistered
+  variables are not propagated and no whole ``Context`` object is pickled.
+  Invalid paths or non-ContextVar attributes raise when the executor is
+  constructed, and the binding configuration participates in the reusable
+  executor compatibility check.
+
 - Fix ``Popen._launch`` on POSIX raising ``UnboundLocalError`` instead of the
   real ``OSError`` when ``os.pipe()`` fails, for instance when the parent process
   runs out of file descriptors (``EMFILE``). (#668)

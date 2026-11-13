@@ -67,11 +67,14 @@ import struct
 import weakref
 import warnings
 import itertools
+import contextvars
+import importlib
 import traceback
 import threading
 from time import time, sleep
 import multiprocessing as mp
 from functools import partial
+from collections.abc import Mapping
 from pickle import PicklingError
 from concurrent.futures import Executor, InvalidStateError
 from concurrent.futures._base import LOGGER
@@ -272,15 +275,164 @@ def _rebuild_exc(exc, tb):
     return exc
 
 
+# Marker used to tell a ContextVar that was never set in the submitting
+# context apart from one that is explicitly set to None or that owns a
+# default value. It only lives in the parent process and is never serialized.
+_UNSET_CONTEXT_VAR = object()
+
+
+def _parse_context_binding_spec(spec):
+    """Turn a binding specification into a ``(module_name, attr_path)`` pair.
+
+    The specification is either a ``"module.path:attribute.path"`` string or
+    a ``(module_name, attr_path)`` pair of non-empty strings. No guessing is
+    done from ``ContextVar.name``: the attribute must be reachable through an
+    explicit importable module path.
+    """
+    if isinstance(spec, str):
+        module_name, sep, attr_path = spec.partition(":")
+        if not sep or not module_name or not attr_path:
+            raise ValueError(
+                "context binding spec must be a "
+                f"'module.path:attribute' string, got {spec!r}"
+            )
+    elif (
+        isinstance(spec, (tuple, list))
+        and len(spec) == 2
+        and all(isinstance(part, str) and part for part in spec)
+    ):
+        module_name, attr_path = spec
+    else:
+        raise TypeError(
+            "context binding spec must be a 'module.path:attribute' string "
+            "or a (module, attribute) pair of non-empty strings, got "
+            f"{spec!r}"
+        )
+    return module_name, attr_path
+
+
+def _resolve_context_var(module_name, attr_path):
+    """Import ``module_name`` and return the object at ``attr_path``.
+
+    The resolution is performed again in the worker processes so that the
+    actual ContextVar exported by the module is used: user functions reading
+    the module attribute then observe the exact same object. The ContextVar
+    itself is never pickled.
+    """
+    module = importlib.import_module(module_name)
+    obj = module
+    for attr in attr_path.split("."):
+        try:
+            obj = getattr(obj, attr)
+        except AttributeError:
+            raise AttributeError(
+                f"module {module_name!r} has no attribute {attr_path!r}"
+            ) from None
+    return obj
+
+
+def _normalize_context_bindings(context_bindings):
+    """Validate executor-level ``context_bindings`` at acceptance time.
+
+    ``context_bindings`` maps logical binding names to explicit module and
+    attribute paths. Each path must resolve to an actual
+    :class:`contextvars.ContextVar`, otherwise a ``TypeError`` (or an
+    ``ImportError``/``AttributeError`` for an unimportable module or missing
+    attribute) is raised while constructing the executor.
+
+    Returns a ``(bindings, context_vars)`` pair where ``bindings`` maps the
+    logical names to normalized ``(module_name, attr_path)`` tuples and
+    ``context_vars`` maps them to the ContextVar objects resolved in the
+    current process.
+    """
+    if context_bindings is None:
+        return {}, {}
+    if not isinstance(context_bindings, Mapping):
+        raise TypeError(
+            "context_bindings must be a mapping of logical binding names to "
+            "'module.path:attribute' strings, got "
+            f"{type(context_bindings).__name__}"
+        )
+
+    bindings = {}
+    context_vars = {}
+    for name, spec in context_bindings.items():
+        if not isinstance(name, str) or not name:
+            raise TypeError(
+                "context binding names must be non-empty strings, got "
+                f"{name!r}"
+            )
+        module_name, attr_path = _parse_context_binding_spec(spec)
+        context_var = _resolve_context_var(module_name, attr_path)
+        if not isinstance(context_var, contextvars.ContextVar):
+            raise TypeError(
+                f"context binding {name!r} ({module_name}:{attr_path}) "
+                f"resolves to {context_var!r} which is not a "
+                "contextvars.ContextVar"
+            )
+        bindings[name] = (module_name, attr_path)
+        context_vars[name] = context_var
+    return bindings, context_vars
+
+
+def _capture_context_bindings(bindings, context_vars):
+    """Snapshot the bound ContextVars from the submitting thread's context.
+
+    The snapshot is taken synchronously when ``submit`` is called, before the
+    task is serialized: later ``set``/``reset`` calls in the submitting
+    thread cannot change the value seen by an already submitted task. The
+    fact that a variable was not set is preserved independently from its
+    value (``None`` is a valid value) and from its default. Only plain values
+    are returned, the whole ``Context`` is never copied nor pickled.
+    """
+    snapshot = []
+    for name, (module_name, attr_path) in bindings.items():
+        # An explicit default wins over the ContextVar own default when the
+        # variable is not set in the current context, so the marker reliably
+        # detects the unset state even for variables owning a default.
+        value = context_vars[name].get(_UNSET_CONTEXT_VAR)
+        if value is _UNSET_CONTEXT_VAR:
+            snapshot.append((module_name, attr_path, False, None))
+        else:
+            snapshot.append((module_name, attr_path, True, value))
+    return tuple(snapshot)
+
+
+def _run_call_with_context_bindings(context_snapshot, fn, args, kwargs):
+    """Execute ``fn`` in an isolated Context with the propagated bindings.
+
+    A fresh empty :class:`contextvars.Context` is created for every call and
+    discarded afterwards. Only the explicitly bound variables that were set
+    in the submitting context are applied; variables that were unset stay
+    unset (they raise ``LookupError`` or fall back to their own default) even
+    if an initializer or a previous task touched them in the worker process.
+    Modifications made by the user function stay confined to the isolated
+    Context, so neither exceptions nor in-task ``set`` calls can leak a value
+    into another task, and the worker's own context is never modified.
+    """
+    isolated_context = contextvars.Context()
+
+    def _run():
+        for module_name, attr_path, is_set, value in context_snapshot:
+            if not is_set:
+                continue
+            context_var = _resolve_context_var(module_name, attr_path)
+            context_var.set(value)
+        return fn(*args, **kwargs)
+
+    return isolated_context.run(_run)
+
+
 class _WorkItem:
 
-    __slots__ = ["future", "fn", "args", "kwargs"]
+    __slots__ = ["future", "fn", "args", "kwargs", "context_bindings"]
 
-    def __init__(self, future, fn, args, kwargs):
+    def __init__(self, future, fn, args, kwargs, context_bindings=None):
         self.future = future
         self.fn = fn
         self.args = args
         self.kwargs = kwargs
+        self.context_bindings = context_bindings
 
 
 class _ResultItem:
@@ -291,17 +443,24 @@ class _ResultItem:
 
 
 class _CallItem:
-    def __init__(self, work_id, fn, args, kwargs):
+    def __init__(self, work_id, fn, args, kwargs, context_bindings=None):
         self.work_id = work_id
         self.fn = fn
         self.args = args
         self.kwargs = kwargs
+        # Snapshot of the bound ContextVars captured at submit time, or None
+        # when the executor has no context_bindings configured.
+        self.context_bindings = context_bindings
 
         # Store the current loky_pickler so it is correctly set in the worker
         self.loky_pickler = get_loky_pickler_name()
 
     def __call__(self):
         set_loky_pickler(self.loky_pickler)
+        if self.context_bindings:
+            return _run_call_with_context_bindings(
+                self.context_bindings, self.fn, self.args, self.kwargs
+            )
         return self.fn(*self.args, **self.kwargs)
 
     def __repr__(self):
@@ -730,6 +889,7 @@ class _ExecutorManagerThread(threading.Thread):
                             work_item.fn,
                             work_item.args,
                             work_item.kwargs,
+                            context_bindings=work_item.context_bindings,
                         ),
                         block=True,
                     )
@@ -1165,6 +1325,7 @@ class ProcessPoolExecutor(Executor):
         initializer=None,
         initargs=(),
         env=None,
+        context_bindings=None,
     ):
         """Initializes a new ProcessPoolExecutor instance.
 
@@ -1189,6 +1350,21 @@ class ProcessPoolExecutor(Executor):
             env: A dict of environment variable to overwrite in the child
                 process. The environment variables are set before any module is
                 loaded. Note that this only works with the loky context.
+            context_bindings: mapping of str to str, optional
+                Mapping of logical names to explicit ``"module.path:attribute"``
+                paths (or ``("module.path", "attribute")`` pairs) referencing
+                :class:`contextvars.ContextVar` objects exported by importable
+                modules. On every :meth:`submit`, the current value of each
+                bound variable is captured in the calling thread's context and
+                propagated to the worker, where the call runs in an isolated
+                ``Context`` with the variables resolved from the same module
+                attributes. Variables that are not set stay unset in the
+                worker (a variable with a default still uses its default),
+                unregistered variables are not propagated and no whole
+                ``Context`` object is ever pickled. Invalid paths or
+                non-ContextVar attributes raise while constructing the
+                executor. New threads created from inside a submitted function
+                are not covered by this propagation mechanism.
         """
         _check_system_limits()
 
@@ -1218,6 +1394,15 @@ class ProcessPoolExecutor(Executor):
             initializer, initargs
         )
         _check_max_depth(self._context)
+
+        # Validate the context bindings at acceptance time and keep both the
+        # normalized module/attribute paths (sent to the workers and used for
+        # reusable executor compatibility checks) and the resolved ContextVar
+        # objects (used for the per-submit snapshots).
+        (
+            self._context_bindings,
+            self._context_vars,
+        ) = _normalize_context_bindings(context_bindings)
 
         if result_reducers is None:
             result_reducers = job_reducers
@@ -1369,7 +1554,16 @@ class ProcessPoolExecutor(Executor):
                 )
 
             f = Future()
-            w = _WorkItem(f, fn, args, kwargs)
+            # Capture the bound ContextVar values now, in the submitting
+            # thread's current context and before the task is serialized by
+            # the queue feeder thread. A later set/reset in this thread
+            # cannot affect this already submitted task.
+            context_snapshot = None
+            if self._context_bindings:
+                context_snapshot = _capture_context_bindings(
+                    self._context_bindings, self._context_vars
+                )
+            w = _WorkItem(f, fn, args, kwargs, context_snapshot)
 
             self._pending_work_items[self._queue_count] = w
             self._work_ids.put(self._queue_count)

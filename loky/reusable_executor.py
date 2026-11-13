@@ -12,7 +12,11 @@ import threading
 import multiprocessing as mp
 from typing import Any
 
-from .process_executor import ProcessPoolExecutor, EXTRA_QUEUED_CALLS
+from .process_executor import (
+    ProcessPoolExecutor,
+    EXTRA_QUEUED_CALLS,
+    _normalize_context_bindings,
+)
 from .backend.context import cpu_count
 from .backend import get_context
 
@@ -58,6 +62,7 @@ def get_reusable_executor(
     initializer=None,
     initargs=(),
     env=None,
+    context_bindings=None,
 ):
     """Return the current ReusableExecutor instance for the current thread.
 
@@ -98,6 +103,11 @@ def get_reusable_executor(
     in the child processes to value ``VAL``. The environment variables are set
     in the children before any module is loaded. This only works with the
     ``loky`` context.
+
+    ``context_bindings`` configures the executor-level propagation of
+    :class:`contextvars.ContextVar` values, see
+    :class:`loky.ProcessPoolExecutor` for the full semantics. Two calls with
+    different ``context_bindings`` never share the same cached executor.
     """
     _executor, _ = _ReusablePoolExecutor.get_reusable_executor(
         max_workers=max_workers,
@@ -110,6 +120,7 @@ def get_reusable_executor(
         initializer=initializer,
         initargs=initargs,
         env=env,
+        context_bindings=context_bindings,
     )
     return _executor
 
@@ -126,6 +137,7 @@ class _ReusablePoolExecutor(ProcessPoolExecutor):
         initializer=None,
         initargs=(),
         env=None,
+        context_bindings=None,
     ):
         super().__init__(
             max_workers=max_workers,
@@ -136,6 +148,7 @@ class _ReusablePoolExecutor(ProcessPoolExecutor):
             initializer=initializer,
             initargs=initargs,
             env=env,
+            context_bindings=context_bindings,
         )
         self.executor_id = executor_id
 
@@ -152,8 +165,14 @@ class _ReusablePoolExecutor(ProcessPoolExecutor):
         initializer=None,
         initargs=(),
         env=None,
+        context_bindings=None,
     ):
         executor = _executor_storage.executor
+
+        # Normalize and validate the bindings before comparing the executor
+        # configurations, so that equivalent spec descriptions compare
+        # equal and any invalid configuration fails right away.
+        context_bindings, _ = _normalize_context_bindings(context_bindings)
 
         if max_workers is None:
             if reuse is True and executor is not None:
@@ -180,6 +199,7 @@ class _ReusablePoolExecutor(ProcessPoolExecutor):
             initializer=initializer,
             initargs=initargs,
             env=env,
+            context_bindings=context_bindings,
         )
         if executor is None:
             is_reused = False
