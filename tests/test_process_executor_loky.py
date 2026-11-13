@@ -6,12 +6,13 @@ from ._test_process_executor import (
     AsCompletedTests,
     ExecutorShutdownTest,
     ExecutorTest,
+    SubmitBatchTest,
     WaitTests,
 )
 
 
 class ProcessPoolLokyMixin(ExecutorMixin):
-    # Makes sure that the context is defined
+    # Makes sure the context is defined
     executor_type = process_executor.ProcessPoolExecutor
     context = get_context("loky")
 
@@ -30,4 +31,8 @@ class TestsProcessPoolLokyAsCompleted(ProcessPoolLokyMixin, AsCompletedTests):
 
 
 class TestsProcessPoolLokyExecutor(ProcessPoolLokyMixin, ExecutorTest):
+    pass
+
+
+class TestsProcessPoolLokySubmitBatch(ProcessPoolLokyMixin, SubmitBatchTest):
     pass

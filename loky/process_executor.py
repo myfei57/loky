@@ -81,8 +81,12 @@ from multiprocessing.connection import wait
 from ._base import Future
 from .backend import get_context
 from .backend.context import cpu_count, _MAX_WINDOWS_WORKERS
-from .backend.queues import Queue, SimpleQueue
-from .backend.reduction import set_loky_pickler, get_loky_pickler_name
+from .backend.queues import Queue, SimpleQueue, _PreSerializedMessage
+from .backend.reduction import (
+    dumps,
+    set_loky_pickler,
+    get_loky_pickler_name,
+)
 from .backend.utils import kill_process_tree, get_exitcodes_terminated_worker
 from .initializers import _prepare_initializer
 
@@ -240,6 +244,15 @@ process_pool_executor_at_exit = None
 # (Futures in the call queue cannot be cancelled).
 EXTRA_QUEUED_CALLS = 1
 
+# Default limits for ProcessPoolExecutor.submit_batch. They bound the
+# resources used while staging a batch before it is published:
+# max_batch_tasks caps the number of tasks read from the input iterable and
+# max_serialized_bytes caps the total serialized payload size kept in
+# memory. These limits do not constrain transient allocations performed
+# inside user reducers.
+_DEFAULT_MAX_BATCH_TASKS = 256
+_DEFAULT_MAX_BATCH_BYTES = 64 * 1024**2
+
 
 class _RemoteTraceback(Exception):
     """Embed stringification of remote traceback in local traceback"""
@@ -274,13 +287,17 @@ def _rebuild_exc(exc, tb):
 
 class _WorkItem:
 
-    __slots__ = ["future", "fn", "args", "kwargs"]
+    __slots__ = ["future", "fn", "args", "kwargs", "serialized"]
 
-    def __init__(self, future, fn, args, kwargs):
+    def __init__(self, future, fn, args, kwargs, serialized=None):
         self.future = future
         self.fn = fn
         self.args = args
         self.kwargs = kwargs
+        # When not None, the task has been pre-serialized at submission time
+        # (see ProcessPoolExecutor.submit_batch): the manager thread must send
+        # these bytes verbatim instead of re-pickling fn/args/kwargs.
+        self.serialized = serialized
 
 
 class _ResultItem:
@@ -332,7 +349,7 @@ class _SafeQueue(Queue):
         super().__init__(max_size, reducers=reducers, ctx=ctx)
 
     def _on_queue_feeder_error(self, e, obj):
-        if not isinstance(obj, _CallItem):
+        if not isinstance(obj, (_CallItem, _PreSerializedMessage)):
             super()._on_queue_feeder_error(e, obj)
             return
         # work_item can be None if another process terminated. In this
@@ -724,16 +741,25 @@ class _ExecutorManagerThread(threading.Thread):
 
                 if work_item.future.set_running_or_notify_cancel():
                     self.running_work_items += [work_id]
-                    self.call_queue.put(
-                        _CallItem(
+                    if work_item.serialized is None:
+                        call_item = _CallItem(
                             work_id,
                             work_item.fn,
                             work_item.args,
                             work_item.kwargs,
-                        ),
-                        block=True,
-                    )
+                        )
+                    else:
+                        # The task was fully serialized by submit_batch: send
+                        # the pre-serialized bytes so the feeder thread never
+                        # runs the user reducers a second time.
+                        call_item = _PreSerializedMessage(
+                            work_id, work_item.serialized
+                        )
+                    self.call_queue.put(call_item, block=True)
                 else:
+                    # The future was cancelled before reaching the call queue:
+                    # drop the work item, including any staged payload, to make
+                    # sure the temporary serialized record is released.
                     del self.pending_work_items[work_id]
                     continue
 
@@ -1151,6 +1177,25 @@ class ShutdownExecutorError(RuntimeError):
     """
 
 
+class BatchSubmissionError(ValueError):
+    """Synchronous failure of ProcessPoolExecutor.submit_batch.
+
+    The whole batch is rejected before anything is published to the executor:
+    no task starts running, no Future is returned and no work id is consumed.
+    The staged serialized payloads are discarded.
+
+    Attributes
+    ----------
+    index: int
+        0-based position of the offending task in the input sequence, or the
+        position at which the input iterator raised.
+    """
+
+    def __init__(self, index, message):
+        self.index = index
+        super().__init__(f"{message} (at batch index {index})")
+
+
 class ProcessPoolExecutor(Executor):
 
     _at_exit = None
@@ -1221,6 +1266,10 @@ class ProcessPoolExecutor(Executor):
 
         if result_reducers is None:
             result_reducers = job_reducers
+
+        # Keep the job reducers accessible so submit_batch can pre-serialize
+        # tasks with the exact pickling configuration of the call queue.
+        self._job_reducers = job_reducers
 
         # Timeout
         self._timeout = timeout
@@ -1381,6 +1430,242 @@ class ProcessPoolExecutor(Executor):
             return f
 
     submit.__doc__ = Executor.submit.__doc__
+
+    @staticmethod
+    def _check_positive_int_limit(name, value):
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ValueError(
+                f"{name} must be a positive integer, got {value!r}"
+            )
+
+    @staticmethod
+    def _parse_batch_item(index, item):
+        """Validate and normalize a single submit_batch input item.
+
+        Raises BatchSubmissionError referencing ``index`` when the item is not
+        a (fn, args) or (fn, args, kwargs) tuple/list.
+        """
+        if not isinstance(item, (tuple, list)):
+            raise BatchSubmissionError(
+                index,
+                "each task item must be a tuple or a list "
+                "(fn, args) or (fn, args, kwargs)",
+            )
+        if len(item) not in (2, 3):
+            raise BatchSubmissionError(
+                index,
+                "each task item must contain 2 or 3 elements: "
+                "a function, positional arguments and optional keyword "
+                "arguments",
+            )
+
+        fn, args = item[0], item[1]
+        if not isinstance(args, (tuple, list)):
+            raise BatchSubmissionError(
+                index,
+                "the positional arguments of a task item must be a tuple "
+                "or a list",
+            )
+        args = tuple(args)
+
+        if len(item) == 3:
+            kwargs = item[2]
+            if not isinstance(kwargs, dict):
+                raise BatchSubmissionError(
+                    index,
+                    "the keyword arguments of a task item must be a dict",
+                )
+        else:
+            kwargs = {}
+
+        return fn, args, kwargs
+
+    def submit_batch(
+        self,
+        tasks,
+        max_batch_tasks=_DEFAULT_MAX_BATCH_TASKS,
+        max_serialized_bytes=_DEFAULT_MAX_BATCH_BYTES,
+    ):
+        """Submit a finite sequence of tasks as a single atomic batch.
+
+        Each item of ``tasks`` is a tuple ``(fn, args)`` or
+        ``(fn, args, kwargs)`` where ``args`` is a tuple/list of positional
+        arguments and ``kwargs`` a dict of keyword arguments. On success, a
+        list of independent :class:`~loky.Future` objects is returned, in the
+        same order as the input tasks.
+
+        The whole batch is serialized in the calling thread, using the current
+        ``job_reducers`` and pickler of the executor, before any of its tasks
+        is published. The worker processes therefore receive an immutable
+        snapshot: mutating the original arguments after this method returns
+        cannot change the tasks, and the user reducers run exactly once per
+        task (the feeder thread never re-encodes them).
+
+        The batch is accepted at a single point in time, under the same lock
+        as :meth:`shutdown`: either every task of the batch is accepted before
+        the executor shuts down or breaks, or the whole batch is rejected. A
+        rejected batch never starts a worker function, never returns a Future
+        and does not consume a work id.
+
+        Args:
+            tasks: finite iterable of ``(fn, args)`` or
+                ``(fn, args, kwargs)`` task items.
+            max_batch_tasks: positive int, maximum number of tasks read from
+                ``tasks``. Reading a task beyond this limit stops the
+                iteration and rejects the whole batch.
+            max_serialized_bytes: positive int, maximum total size in bytes of
+                the serialized task payloads. When adding a task would exceed
+                the budget, reading stops, the staged payloads are discarded
+                and the whole batch is rejected. This budget only counts the
+                produced payloads, not transient allocations made inside user
+                reducers.
+
+        Returns:
+            A list of :class:`~loky.Future` in input order. An empty input
+            yields an empty list without starting any worker process.
+
+        Raises:
+            BatchSubmissionError: a task item is malformed, a task cannot be
+                serialized, the input iterator raised, or one of the two
+                limits would be exceeded. The ``index`` attribute locates the
+                offending position (0-based).
+            ShutdownExecutorError / BrokenProcessPool: the executor was shut
+                down or broken before the batch could be accepted.
+        """
+        self._check_positive_int_limit("max_batch_tasks", max_batch_tasks)
+        self._check_positive_int_limit(
+            "max_serialized_bytes", max_serialized_bytes
+        )
+
+        try:
+            iterator = iter(tasks)
+        except TypeError as exc:
+            raise BatchSubmissionError(
+                0, "tasks must be an iterable of task items"
+            ) from exc
+
+        # Stage the serialized payloads of the whole batch here. Every entry
+        # is an immutable bytes object, so total staging memory is bounded by
+        # max_serialized_bytes and nothing references the caller's objects
+        # anymore once serialization is done.
+        staged_payloads = []
+        total_serialized_bytes = 0
+        index = 0
+        try:
+            while True:
+                try:
+                    item = next(iterator)
+                except StopIteration:
+                    break
+                except BaseException as exc:
+                    raise BatchSubmissionError(
+                        index,
+                        "the input iterator raised while reading a task",
+                    ) from exc
+
+                if index >= max_batch_tasks:
+                    raise BatchSubmissionError(
+                        index,
+                        f"batch contains more than max_batch_tasks="
+                        f"{max_batch_tasks} tasks",
+                    )
+
+                fn, args, kwargs = self._parse_batch_item(index, item)
+
+                # The work id is only allocated at publication time. It is a
+                # routing attribute, not part of the task content, so a
+                # placeholder is used while serializing.
+                call_item = _CallItem(-1, fn, args, kwargs)
+                try:
+                    payload = bytes(
+                        dumps(
+                            call_item,
+                            reducers=self._job_reducers,
+                        )
+                    )
+                except BaseException as exc:
+                    raise BatchSubmissionError(
+                        index, "could not serialize the task"
+                    ) from exc
+                del call_item
+
+                if total_serialized_bytes + len(payload) > (
+                    max_serialized_bytes
+                ):
+                    raise BatchSubmissionError(
+                        index,
+                        "the serialized batch would exceed the "
+                        f"max_serialized_bytes budget of "
+                        f"{max_serialized_bytes} bytes",
+                    )
+
+                total_serialized_bytes += len(payload)
+                staged_payloads.append(payload)
+                index += 1
+        except BaseException:
+            # Discard everything staged so far: no task has been published,
+            # no work id has been consumed and no Future exists yet.
+            staged_payloads.clear()
+            raise
+
+        if not staged_payloads:
+            # An empty batch is a no-op: it does not touch the executor state
+            # and must not spawn worker processes.
+            return []
+
+        try:
+            # Single atomic acceptance point: shutdown and broken state
+            # transitions also take this lock, so a batch is either fully
+            # accepted or fully rejected, never partially.
+            with self._flags.shutdown_lock:
+                if self._flags.broken is not None:
+                    raise self._flags.broken
+                if self._flags.shutdown:
+                    raise ShutdownExecutorError(
+                        "cannot schedule new futures after shutdown"
+                    )
+
+                # Cannot submit new calls once the interpreter is shutting
+                # down. This check avoids spawning new processes at exit.
+                if _global_shutdown:
+                    raise RuntimeError(
+                        "cannot schedule new futures after interpreter "
+                        "shutdown"
+                    )
+
+                futures = []
+                first_work_id = self._queue_count
+                for offset, payload in enumerate(staged_payloads):
+                    work_id = first_work_id + offset
+                    future = Future()
+                    self._pending_work_items[work_id] = _WorkItem(
+                        future,
+                        None,
+                        (),
+                        {},
+                        serialized=payload,
+                    )
+                    self._work_ids.put(work_id)
+                    futures.append(future)
+                # Allocate the whole contiguous work id range at once so that
+                # concurrent submit() calls can neither duplicate nor lose an
+                # id.
+                self._queue_count = first_work_id + len(staged_payloads)
+
+                # Wake up queue management thread
+                self._executor_manager_thread_wakeup.wakeup()
+
+                self._ensure_executor_running()
+        except BaseException:
+            # The state checks above rejected the batch: release the staged
+            # payloads instead of leaking them. No executor state was touched.
+            staged_payloads.clear()
+            raise
+
+        # The work items now own the payload references; drop the local
+        # staging list without re-serializing anything.
+        staged_payloads.clear()
+        return futures
 
     def map(self, fn, *iterables, **kwargs):
         """Returns an iterator equivalent to map(fn, iter).

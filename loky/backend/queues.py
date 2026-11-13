@@ -21,10 +21,42 @@ from multiprocessing.queues import (
 )
 from multiprocessing.context import assert_spawning
 
-from .reduction import dumps
+from .reduction import dumps, loads
 
 
 __all__ = ["Queue", "SimpleQueue", "Full"]
+
+
+def _rebuild_pre_serialized_message(work_id, payload):
+    """Rebuild a task in the worker from its pre-serialized pickle stream.
+
+    ``payload`` is the exact byte stream produced for the task in the
+    submitting process. Only the routing ``work_id`` is attached here, so the
+    user-provided reducers are never executed a second time.
+    """
+    obj = loads(payload)
+    obj.work_id = work_id
+    return obj
+
+
+class _PreSerializedMessage:
+    """A task already serialized with the queue pickler.
+
+    The feeder thread must send ``payload`` verbatim instead of pickling the
+    task again: user reducers may have side effects and the submitting thread
+    is required to encode every task exactly once. Pickling this message only
+    serializes an integer work id and opaque bytes, so the user reducers are
+    not involved.
+    """
+
+    __slots__ = ("work_id", "payload")
+
+    def __init__(self, work_id, payload):
+        self.work_id = work_id
+        self.payload = payload
+
+    def __reduce__(self):
+        return _rebuild_pre_serialized_message, (self.work_id, self.payload)
 
 
 class Queue(mp_Queue):
@@ -156,7 +188,15 @@ class Queue(mp_Queue):
                             return
 
                         # serialize the data before acquiring the lock
-                        obj_ = dumps(obj, reducers=reducers)
+                        if isinstance(obj, _PreSerializedMessage):
+                            # The task itself has already been serialized at
+                            # submission time. Only the routing work id and
+                            # the opaque payload are pickled here, without the
+                            # user-provided reducers, which must run exactly
+                            # once per task.
+                            obj_ = dumps(obj, reducers=None)
+                        else:
+                            obj_ = dumps(obj, reducers=reducers)
                         if wacquire is None:
                             send_bytes(obj_)
                         else:

@@ -6,6 +6,7 @@ import gc
 import sys
 import time
 import shutil
+import random
 import platform
 import pytest
 import weakref
@@ -28,16 +29,24 @@ from concurrent.futures._base import (
 
 import loky
 from loky.process_executor import (
+    _CallItem,
+    BatchSubmissionError,
     LokyRecursionError,
     BrokenProcessPool,
     ShutdownExecutorError,
     TerminatedWorkerError,
 )
+from loky.backend.reduction import dumps
 from loky._base import Future
 
 from . import _executor_mixin
 from .utils import id_sleep, check_subprocess_call, filter_match
-from .test_reusable_executor import ErrorAtPickle, ExitAtPickle, c_exit
+from .test_reusable_executor import (
+    ErrorAtPickle,
+    ErrorAtUnpickle,
+    ExitAtPickle,
+    c_exit,
+)
 
 
 def create_future(state=PENDING, exception=None, result=None):
@@ -97,6 +106,105 @@ class MyObject:
 
     def my_method(self):
         pass
+
+
+# --------------------------------------------------------------------------
+# Helpers for ProcessPoolExecutor.submit_batch tests. These must be top
+# level objects so that they can be imported by the worker processes when
+# using the spawn/forkserver start methods.
+# --------------------------------------------------------------------------
+
+
+def _batch_identity(x):
+    return x
+
+
+def _batch_kwfunc(x, y=0, z=0):
+    return (x, y, z)
+
+
+def _batch_append_log(log_path, marker):
+    """Append a marker to an execution log file and return the marker."""
+    with open(log_path, mode="a") as f:
+        f.write(f"{marker}\n")
+    return marker
+
+
+def _batch_raise(exc):
+    raise exc
+
+
+class _BatchObject:
+    def __init__(self, value):
+        self.value = value
+
+    def __eq__(self, other):
+        return isinstance(other, _BatchObject) and other.value == self.value
+
+
+# Parent-side reducer state: reducers only run in the submitting process, so
+# plain module level containers are enough to observe how many times they run.
+_batch_reducer_events = []
+_batch_encoded_object_ids = set()
+
+
+def _reset_batch_reducer_state():
+    _batch_reducer_events.clear()
+    _batch_encoded_object_ids.clear()
+
+
+def _batch_counting_reducer(obj):
+    _batch_reducer_events.append(("encode", obj.value))
+    return _BatchObject, (obj.value,)
+
+
+def _batch_fail_on_second_call_reducer(obj):
+    """Fail when the reducer is invoked for the second time overall."""
+    _batch_reducer_events.append(("fail-on-second", obj.value))
+    if len(_batch_reducer_events) >= 2:
+        raise RuntimeError("the reducer must not be called twice")
+    return _BatchObject, (obj.value,)
+
+
+def _batch_fail_on_reencode_reducer(obj):
+    """Fail if the very same object is encoded more than once."""
+    if id(obj) in _batch_encoded_object_ids:
+        raise RuntimeError(f"object {id(obj)} has been encoded twice")
+    _batch_encoded_object_ids.add(id(obj))
+    return _BatchObject, (obj.value,)
+
+
+class _FailingBatchIterable:
+    """Iterable raising a custom error at a fixed task index.
+
+    ``consumed`` records how many items have actually been yielded, which
+    lets tests check that submit_batch stops reading after a failure.
+    """
+
+    def __init__(self, items, fail_at):
+        self._items = items
+        self._fail_at = fail_at
+        self.consumed = 0
+
+    def __iter__(self):
+        for index, item in enumerate(self._items):
+            if index == self._fail_at:
+                raise ValueError("synthetic iterator failure")
+            self.consumed += 1
+            yield item
+
+
+class _CountingBatchIterable:
+    """Iterable counting how many items the consumer pulled."""
+
+    def __init__(self, items):
+        self._items = items
+        self.consumed = 0
+
+    def __iter__(self):
+        for item in self._items:
+            self.consumed += 1
+            yield item
 
 
 def _assert_no_error(stderr):
@@ -1331,6 +1439,597 @@ class ExecutorTest:
         assert not manager.is_alive()
         with pytest.raises(BrokenProcessPool):
             self.executor.submit(int)
+
+
+class SubmitBatchTest:
+    """Functional tests for ProcessPoolExecutor.submit_batch."""
+
+    def _fresh_executor(self, **kwargs):
+        """Replace the primed executor by a brand new one.
+
+        The executor created here is assigned to ``self.executor`` so that
+        the mixin teardown still shuts it down reliably.
+        """
+        self.executor.shutdown(wait=True)
+        self.executor = self.executor_type(
+            max_workers=self.worker_count,
+            context=self.context,
+            **kwargs,
+        )
+        return self.executor
+
+    @staticmethod
+    def _assert_no_published_work(executor, queue_count):
+        assert executor._queue_count == queue_count
+        assert executor._pending_work_items == {}
+        assert executor._work_ids.empty()
+        assert executor._running_work_items == []
+
+    @staticmethod
+    def _make_log_file():
+        tmp_dir = tempfile.mkdtemp()
+        return tmp_dir, os.path.join(tmp_dir, "execution.log")
+
+    @pytest.mark.timeout(60)
+    def test_submit_batch_basic(self):
+        tasks = [
+            (_batch_identity, (1,)),
+            (_batch_kwfunc, (2,), {"y": 3}),
+            (_batch_kwfunc, (4,), {"y": 5, "z": 6}),
+        ]
+        # A generator is a valid finite input iterable.
+        futures = self.executor.submit_batch(iter(tasks))
+        assert isinstance(futures, list)
+        assert len(futures) == 3
+        assert all(isinstance(f, Future) for f in futures)
+        assert len(set(map(id, futures))) == 3
+        assert [
+            f.result(timeout=_executor_mixin.TIMEOUT) for f in futures
+        ] == [1, (2, 3, 0), (4, 5, 6)]
+
+        # Mixed usage with the plain submit API on the same executor.
+        single_future = self.executor.submit(_batch_identity, 7)
+        batch_future = self.executor.submit_batch([(_batch_identity, (8,))])[0]
+        assert single_future.result(timeout=_executor_mixin.TIMEOUT) == 7
+        assert batch_future.result(timeout=_executor_mixin.TIMEOUT) == 8
+
+    @pytest.mark.timeout(60)
+    def test_submit_batch_empty_does_not_start_workers(self):
+        executor = self._fresh_executor()
+        try:
+            assert executor.submit_batch([]) == []
+            assert executor.submit_batch(iter(())) == []
+            # No state is touched and no worker process is spawned.
+            assert executor._executor_manager_thread is None
+            assert executor._processes == {}
+            assert executor._work_ids.empty()
+            assert executor._queue_count == 0
+            assert executor._pending_work_items == {}
+        finally:
+            executor.shutdown(wait=True)
+
+    @pytest.mark.timeout(60)
+    def test_submit_batch_last_item_unpicklable(self):
+        executor = self._fresh_executor()
+        tmp_dir, log_path = self._make_log_file()
+        queue_count = executor._queue_count
+        tasks = [
+            (_batch_append_log, (log_path, "first")),
+            (_batch_append_log, (log_path, "second")),
+            (_batch_identity, (ErrorAtPickle(),)),
+        ]
+        try:
+            with pytest.raises(BatchSubmissionError) as exc_info:
+                executor.submit_batch(tasks)
+            assert exc_info.value.index == 2
+            assert isinstance(exc_info.value.__cause__, PicklingError)
+            # Nothing was published: no future, no consumed work id.
+            self._assert_no_published_work(executor, queue_count)
+            assert executor._executor_manager_thread is None
+            assert executor._processes == {}
+            # No task from the rejected batch ever runs.
+            time.sleep(0.5)
+            assert not os.path.exists(log_path)
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+            executor.shutdown(wait=True)
+
+    @pytest.mark.timeout(60)
+    def test_submit_batch_reducer_second_call_fails(self):
+        _reset_batch_reducer_state()
+        executor = self._fresh_executor(
+            job_reducers={_BatchObject: _batch_fail_on_second_call_reducer}
+        )
+        tmp_dir, log_path = self._make_log_file()
+        queue_count = executor._queue_count
+        tasks = [
+            (_batch_append_log, (log_path, 0)),
+            (_batch_identity, (_BatchObject(1),)),
+            (_batch_identity, (_BatchObject(2),)),
+        ]
+        try:
+            with pytest.raises(BatchSubmissionError) as exc_info:
+                executor.submit_batch(tasks)
+            assert exc_info.value.index == 2
+            assert isinstance(exc_info.value.__cause__, RuntimeError)
+            self._assert_no_published_work(executor, queue_count)
+            time.sleep(0.5)
+            assert not os.path.exists(log_path)
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+            executor.shutdown(wait=True)
+
+    @pytest.mark.timeout(60)
+    def test_submit_batch_iterator_raises(self):
+        executor = self._fresh_executor()
+        tmp_dir, log_path = self._make_log_file()
+        queue_count = executor._queue_count
+        good_tasks = [(_batch_append_log, (log_path, i)) for i in range(5)]
+        iterable = _FailingBatchIterable(good_tasks, fail_at=2)
+        try:
+            with pytest.raises(BatchSubmissionError) as exc_info:
+                executor.submit_batch(iterable)
+            assert exc_info.value.index == 2
+            assert isinstance(exc_info.value.__cause__, ValueError)
+            # Reading stopped at the failing item, nothing beyond was pulled.
+            assert iterable.consumed == 2
+            self._assert_no_published_work(executor, queue_count)
+            assert executor._executor_manager_thread is None
+            time.sleep(0.5)
+            assert not os.path.exists(log_path)
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+            executor.shutdown(wait=True)
+
+    @pytest.mark.timeout(60)
+    def test_submit_batch_invalid_limits(self):
+        for bad_value in (0, -1, 1.5, "10", True, False):
+            with pytest.raises(ValueError):
+                self.executor.submit_batch(
+                    [(_batch_identity, (1,))],
+                    max_batch_tasks=bad_value,
+                )
+            with pytest.raises(ValueError):
+                self.executor.submit_batch(
+                    [(_batch_identity, (1,))],
+                    max_serialized_bytes=bad_value,
+                )
+
+    @pytest.mark.timeout(60)
+    def test_submit_batch_task_limit_boundary(self):
+        tasks = [(_batch_identity, (i,)) for i in range(4)]
+
+        futures = self.executor.submit_batch(tasks, max_batch_tasks=4)
+        assert [
+            f.result(timeout=_executor_mixin.TIMEOUT) for f in futures
+        ] == [0, 1, 2, 3]
+
+        iterable = _CountingBatchIterable(tasks)
+        with pytest.raises(BatchSubmissionError) as exc_info:
+            self.executor.submit_batch(iterable, max_batch_tasks=3)
+        assert exc_info.value.index == 3
+        # The offending item is read but no further reading happens.
+        assert iterable.consumed == 4
+        assert self.executor._work_ids.empty()
+
+    @pytest.mark.timeout(60)
+    def test_submit_batch_byte_budget_boundary(self):
+        tasks = [(_batch_identity, (i,)) for i in range(3)]
+        payload_sizes = [
+            len(bytes(dumps(_CallItem(-1, fn, args, {}))))
+            for fn, args in tasks
+        ]
+        total_size = sum(payload_sizes)
+
+        # A budget exactly matching the payload total is accepted.
+        futures = self.executor.submit_batch(
+            tasks, max_serialized_bytes=total_size
+        )
+        assert [
+            f.result(timeout=_executor_mixin.TIMEOUT) for f in futures
+        ] == [0, 1, 2]
+
+        # One byte short is rejected at the last item position.
+        with pytest.raises(BatchSubmissionError) as exc_info:
+            self.executor.submit_batch(
+                tasks, max_serialized_bytes=total_size - 1
+            )
+        assert exc_info.value.index == 2
+
+        # A budget only fitting the first item stops at index 1.
+        iterable = _CountingBatchIterable(tasks)
+        with pytest.raises(BatchSubmissionError) as exc_info:
+            self.executor.submit_batch(
+                iterable,
+                max_serialized_bytes=payload_sizes[0],
+            )
+        assert exc_info.value.index == 1
+        assert iterable.consumed == 2
+        assert self.executor._work_ids.empty()
+
+    @pytest.mark.timeout(60)
+    def test_submit_batch_malformed_items(self):
+        queue_count = self.executor._queue_count
+        cases = [
+            ([42], 0),
+            ([(_batch_identity, (1,)), 42], 1),
+            ([(_batch_identity, (1,), {}, "extra")], 0),
+            ([(_batch_identity, "args-not-a-tuple")], 0),
+            ([(_batch_identity, (1,), "kwargs-not-a-dict")], 0),
+            ([(_batch_identity, (1,)), ("only-fn",)], 1),
+        ]
+        for tasks, expected_index in cases:
+            with pytest.raises(BatchSubmissionError) as exc_info:
+                self.executor.submit_batch(tasks)
+            assert exc_info.value.index == expected_index
+            self._assert_no_published_work(self.executor, queue_count)
+
+        with pytest.raises(BatchSubmissionError) as exc_info:
+            self.executor.submit_batch(42)
+        assert exc_info.value.index == 0
+        self._assert_no_published_work(self.executor, queue_count)
+
+    @pytest.mark.timeout(60)
+    def test_submit_batch_snapshot_after_mutation(self):
+        positional = [1, 2, 3]
+        nested = {"k": [9]}
+        keyword = {"z": nested}
+        futures = self.executor.submit_batch(
+            [
+                (_batch_kwfunc, (positional,), {"y": 1}),
+                (_batch_kwfunc, (7,), keyword),
+            ]
+        )
+        # Mutate every caller-owned object after the batch was accepted:
+        # workers must only see the pre-serialized snapshot.
+        positional.append(4)
+        nested["k"].append(10)
+        keyword["extra"] = "unseen"
+
+        assert futures[0].result(timeout=_executor_mixin.TIMEOUT) == (
+            [1, 2, 3],
+            1,
+            0,
+        )
+        assert futures[1].result(timeout=_executor_mixin.TIMEOUT) == (
+            7,
+            0,
+            {"k": [9]},
+        )
+
+    @pytest.mark.timeout(60)
+    def test_submit_batch_reducer_runs_once(self):
+        _reset_batch_reducer_state()
+        executor = self._fresh_executor(
+            job_reducers={_BatchObject: _batch_counting_reducer}
+        )
+        objects = [_BatchObject(i) for i in range(6)]
+        try:
+            futures = executor.submit_batch(
+                [(_batch_identity, (obj,)) for obj in objects]
+            )
+            # Every reducer already ran synchronously in the submitting
+            # thread before the futures are even returned.
+            assert _batch_reducer_events == [("encode", i) for i in range(6)]
+            results = [
+                f.result(timeout=_executor_mixin.TIMEOUT) for f in futures
+            ]
+            assert results == [_BatchObject(i) for i in range(6)]
+            # Let the feeder thread and workers settle: re-encoding would add
+            # extra reducer events here.
+            time.sleep(0.5)
+            assert len(_batch_reducer_events) == 6
+        finally:
+            executor.shutdown(wait=True)
+
+    @pytest.mark.timeout(60)
+    def test_submit_batch_reducer_not_rerun_in_feeder(self):
+        _reset_batch_reducer_state()
+        executor = self._fresh_executor(
+            job_reducers={_BatchObject: _batch_fail_on_reencode_reducer}
+        )
+        try:
+            obj = _BatchObject(42)
+            futures = executor.submit_batch([(_batch_identity, (obj,))])
+            assert id(obj) in _batch_encoded_object_ids
+            # A second encoding in the feeder thread would raise and fail the
+            # future instead of returning the reconstructed object.
+            assert futures[0].result(
+                timeout=_executor_mixin.TIMEOUT
+            ) == _BatchObject(42)
+            time.sleep(0.3)
+            assert len(_batch_encoded_object_ids) == 1
+        finally:
+            executor.shutdown(wait=True)
+
+    @pytest.mark.timeout(60)
+    def test_submit_batch_independent_cancel_and_failure(self):
+        n_tasks = 2 * self.worker_count + 4
+        tasks = [(id_sleep, (f"task-{i}", 0.1)) for i in range(n_tasks)]
+        # One task fails on the worker side, independently of the others.
+        failing_index = 2
+        tasks[failing_index] = (
+            _batch_raise,
+            (ValueError("synthetic task failure"),),
+            {},
+        )
+
+        futures = self.executor.submit_batch(tasks)
+        assert len(futures) == n_tasks
+        future_to_id = {
+            id(work_item.future): work_id
+            for work_id, work_item in (
+                self.executor._pending_work_items.items()
+            )
+        }
+
+        # Cancel from the tail: the oversized batch keeps pending items even
+        # once the call queue is full.
+        cancelled_future = None
+        for future in reversed(futures):
+            if future.cancel():
+                cancelled_future = future
+                break
+        assert cancelled_future is not None
+        cancelled_index = futures.index(cancelled_future)
+        cancelled_id = future_to_id[id(cancelled_future)]
+        assert cancelled_index != failing_index
+
+        for index, future in enumerate(futures):
+            if index == cancelled_index:
+                assert future.cancelled()
+            elif index == failing_index:
+                with pytest.raises(ValueError, match="synthetic task"):
+                    future.result(timeout=_executor_mixin.TIMEOUT)
+            else:
+                assert (
+                    future.result(timeout=_executor_mixin.TIMEOUT)
+                    == f"task-{index}"
+                )
+
+        # The staged payload of the early-cancelled item is released.
+        deadline = time.time() + _executor_mixin.TIMEOUT
+        while (
+            cancelled_id in self.executor._pending_work_items
+            and time.time() < deadline
+        ):
+            time.sleep(0.05)
+        assert cancelled_id not in self.executor._pending_work_items
+        while self.executor._pending_work_items and time.time() < deadline:
+            time.sleep(0.05)
+        assert not self.executor._pending_work_items
+        assert self.executor._work_ids.empty()
+        assert self.executor._flags.broken is None
+        gc.collect()
+
+    @pytest.mark.timeout(120)
+    def test_submit_batch_shutdown_race(self):
+        batch_size = 8
+        for _ in range(15):
+            executor = self.executor_type(max_workers=2, context=self.context)
+            barrier = threading.Barrier(2)
+            outcome = {}
+
+            def submitter():
+                barrier.wait()
+                try:
+                    outcome["futures"] = executor.submit_batch(
+                        [(_batch_identity, (i,)) for i in range(batch_size)]
+                    )
+                except BaseException as exc:
+                    outcome["error"] = exc
+
+            def shutdowner():
+                barrier.wait()
+                time.sleep(random.random() * 0.01)
+                executor.shutdown(wait=False)
+
+            threads = [
+                threading.Thread(target=submitter),
+                threading.Thread(target=shutdowner),
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+
+            if "error" in outcome:
+                # Full rejection: the barrier must never leave half a batch.
+                assert isinstance(
+                    outcome["error"], ShutdownExecutorError
+                ), outcome["error"]
+                assert executor._work_ids.empty()
+                assert executor._pending_work_items == {}
+            else:
+                batch_futures = outcome["futures"]
+                assert len(batch_futures) == batch_size
+                results = [
+                    f.result(timeout=_executor_mixin.TIMEOUT)
+                    for f in batch_futures
+                ]
+                assert sorted(results) == list(range(batch_size))
+
+            executor.shutdown(wait=True)
+
+    @pytest.mark.timeout(120)
+    def test_submit_batch_broken_race(self):
+        for _ in range(10):
+            executor = self.executor_type(max_workers=2, context=self.context)
+            barrier = threading.Barrier(2)
+            outcome = {}
+            sentinel_error = BrokenProcessPool("synthetic broken state")
+
+            def submitter():
+                barrier.wait()
+                try:
+                    outcome["futures"] = executor.submit_batch(
+                        [(_batch_identity, (i,)) for i in range(6)]
+                    )
+                except BaseException as exc:
+                    outcome["error"] = exc
+
+            def breaker():
+                barrier.wait()
+                time.sleep(random.random() * 0.01)
+                executor._flags.flag_as_broken(sentinel_error)
+                with executor._shutdown_lock:
+                    wakeup = executor._executor_manager_thread_wakeup
+                    if wakeup is not None:
+                        wakeup.wakeup()
+
+            threads = [
+                threading.Thread(target=submitter),
+                threading.Thread(target=breaker),
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+
+            if "error" in outcome:
+                assert isinstance(outcome["error"], BrokenProcessPool)
+                assert executor._pending_work_items == {}
+            else:
+                # Accepted just before the break: never a partial batch, and
+                # the existing broken semantics fail every pending future.
+                assert len(outcome["futures"]) == 6
+                for future in outcome["futures"]:
+                    with pytest.raises(BrokenProcessPool):
+                        future.result(timeout=_executor_mixin.TIMEOUT)
+
+            executor.shutdown(wait=True, kill_workers=True)
+
+    @pytest.mark.timeout(120)
+    def test_submit_batch_mixed_concurrent_submissions(self):
+        executor = self.executor
+        # The fixture priming already consumed work ids before the tracker is
+        # installed: only assert on the range allocated afterwards.
+        start_queue_count = executor._queue_count
+        recorded_ids = []
+        original_put = executor._work_ids.put
+
+        def tracked_put(work_id):
+            recorded_ids.append(work_id)
+            return original_put(work_id)
+
+        executor._work_ids.put = tracked_put
+        counter_lock = threading.Lock()
+        counter = {"value": 0}
+        all_futures = []
+        futures_lock = threading.Lock()
+
+        def next_token():
+            with counter_lock:
+                token = counter["value"]
+                counter["value"] += 1
+            return token
+
+        try:
+
+            def worker(worker_id):
+                local_futures = []
+                for _ in range(10):
+                    if worker_id % 2 == 0:
+                        local_futures.append(
+                            executor.submit(_batch_identity, next_token())
+                        )
+                    else:
+                        local_futures.extend(
+                            executor.submit_batch(
+                                [
+                                    (_batch_identity, (next_token(),)),
+                                    (_batch_identity, (next_token(),)),
+                                ]
+                            )
+                        )
+                    time.sleep(0.001)
+                with futures_lock:
+                    all_futures.extend(local_futures)
+
+            threads = [
+                threading.Thread(target=worker, args=(i,)) for i in range(8)
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+
+            # Concurrent single-item cancellation on a big pending batch.
+            n_tasks = 2 * self.worker_count + 6
+            big_batch = executor.submit_batch(
+                [(id_sleep, (f"cancel-{i}", 0.05)) for i in range(n_tasks)]
+            )
+            cancelled = []
+
+            def cancel_some():
+                for future in reversed(big_batch):
+                    if future.cancel():
+                        cancelled.append(future)
+                        if len(cancelled) >= 3:
+                            break
+
+            cancel_thread = threading.Thread(target=cancel_some)
+            cancel_thread.start()
+            cancel_thread.join()
+
+            for index, future in enumerate(big_batch):
+                if future in cancelled:
+                    assert future.cancelled()
+                else:
+                    assert (
+                        future.result(timeout=_executor_mixin.TIMEOUT)
+                        == f"cancel-{index}"
+                    )
+        finally:
+            executor._work_ids.put = original_put
+
+        results = [
+            future.result(timeout=_executor_mixin.TIMEOUT)
+            for future in all_futures
+            if not future.cancelled()
+        ]
+        # Every non-cancelled task ran exactly once: no duplicated or lost
+        # work, and the returned tokens are all distinct.
+        assert len(results) == len(set(results))
+        assert sorted(results) == list(range(len(results)))
+
+        # No duplicated or missing work id across submit and submit_batch.
+        assert len(recorded_ids) == len(set(recorded_ids))
+        assert sorted(recorded_ids) == list(
+            range(start_queue_count, executor._queue_count)
+        )
+
+    @pytest.mark.broken_pool
+    @pytest.mark.timeout(60)
+    def test_submit_batch_worker_unpickle_error_breaks_pool(self):
+        tasks = [
+            (_batch_identity, (1,)),
+            (id, (ErrorAtUnpickle(),)),
+            (_batch_identity, (3,)),
+        ]
+        futures = self.executor.submit_batch(tasks)
+        assert len(futures) == 3
+
+        deadline = time.time() + _executor_mixin.TIMEOUT
+        while self.executor._flags.broken is None and time.time() < deadline:
+            time.sleep(0.05)
+        assert self.executor._flags.broken is not None
+
+        # terminate_broken fails every still-pending future, so a task that
+        # did not get to run reports BrokenProcessPool; the exact set of
+        # completed tasks depends on scheduling and must not be asserted on.
+        outcomes = []
+        for future in futures:
+            try:
+                outcomes.append(future.result(timeout=_executor_mixin.TIMEOUT))
+            except BrokenProcessPool:
+                outcomes.append("broken")
+        assert "broken" in outcomes
+        assert all(outcome in ("broken", 1, 3) for outcome in outcomes)
+
+        # Existing broken semantics still apply to later submissions.
+        with pytest.raises(BrokenProcessPool):
+            self.executor.submit(_batch_identity, 1)
 
 
 def _custom_initializer():

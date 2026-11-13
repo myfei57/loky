@@ -7,6 +7,7 @@ from ._test_process_executor import (
     AsCompletedTests,
     ExecutorShutdownTest,
     ExecutorTest,
+    SubmitBatchTest,
     WaitTests,
 )
 
@@ -34,4 +35,8 @@ class TestsProcessPoolSpawnAsCompleted(
 
 
 class TestsProcessPoolSpawnExecutor(ProcessPoolSpawnMixin, ExecutorTest):
+    pass
+
+
+class TestsProcessPoolSpawnSubmitBatch(ProcessPoolSpawnMixin, SubmitBatchTest):
     pass
