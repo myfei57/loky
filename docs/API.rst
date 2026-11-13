@@ -29,6 +29,41 @@ The benefits and drawbacks of each method are highlighted in this example_.
 .. autofunction:: loky.wrap_non_picklable_objects
 
 
+Publishing read-only objects once
+----------------------------------
+
+When the same large read-only input is needed by many tasks, pickling it with
+every :code:`submit` call is wasteful. :code:`ProcessPoolExecutor.publish_object`
+serializes such an object a single time, synchronously, using the executor
+:code:`job_reducers` rules, and keeps the resulting snapshot in the parent
+process. It returns an opaque :class:`~loky.ObjectHandle` bound to the
+executor identity and to the publish generation:
+
+.. code-block:: python
+
+    handle = executor.publish_object(large_read_only_input)
+    future = executor.submit_with_objects(worker_fn, [handle], other_arg)
+
+:code:`submit_with_objects` only resolves the handles listed in its explicit
+:code:`objects` argument and passes the restored objects to the user function
+as independent leading positional arguments, in list order. The regular
+arguments are never inspected for handles, and a plain :code:`submit` call
+never resolves a handle either.
+
+Each worker process deserializes the snapshot at most once and then reuses
+its own local copy; worker copies are independent and the contract is
+read-only (loky does not provide shared mutable memory). If an idle worker
+exits or is recycled, its replacement restores the same snapshot from the
+parent on demand. :meth:`ObjectHandle.release` is idempotent: it rejects new
+submissions while letting already accepted tasks complete, and the parent
+snapshot and the worker copies are released only once the last in-flight user
+finishes.
+
+.. autoclass:: loky.ObjectHandle
+    :members:
+    :special-members: release
+
+
 Protection against memory leaks
 -------------------------------
 The memory size of long running worker processes can increase indefinitely if a

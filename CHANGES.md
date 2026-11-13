@@ -1,5 +1,15 @@
 ### 3.8.0 - In development
 
+- Add ``ProcessPoolExecutor.publish_object`` and
+  ``ProcessPoolExecutor.submit_with_objects`` to publish a large read-only
+  input once: the object is serialized a single time in the parent process and
+  each worker deserializes the saved snapshot at most once, reusing its local
+  copy through opaque ``ObjectHandle`` references. Handles are only resolved
+  when listed explicitly in ``submit_with_objects``; regular ``submit`` calls
+  never scan arguments for handles. Handles support idempotent ``release`` with
+  in-flight task tracking, per-worker isolation, snapshot restoration after
+  worker recycling, and full cleanup on shutdown or broken-pool recovery.
+
 - Fix ``Popen._launch`` on POSIX raising ``UnboundLocalError`` instead of the
   real ``OSError`` when ``os.pipe()`` fails, for instance when the parent process
   runs out of file descriptors (``EMFILE``). (#668)

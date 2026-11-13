@@ -79,10 +79,15 @@ from concurrent.futures.process import BrokenProcessPool as _BPPException
 from multiprocessing.connection import wait
 
 from ._base import Future
+from ._objects import _ObjectInfrastructure, _WorkerObjectCache
 from .backend import get_context
 from .backend.context import cpu_count, _MAX_WINDOWS_WORKERS
 from .backend.queues import Queue, SimpleQueue
-from .backend.reduction import set_loky_pickler, get_loky_pickler_name
+from .backend.reduction import (
+    dumps,
+    set_loky_pickler,
+    get_loky_pickler_name,
+)
 from .backend.utils import kill_process_tree, get_exitcodes_terminated_worker
 from .initializers import _prepare_initializer
 
@@ -92,6 +97,10 @@ from .initializers import _prepare_initializer
 # Executor, a LokyRecursionError is raised
 MAX_DEPTH = int(os.environ.get("LOKY_MAX_DEPTH", 10))
 _CURRENT_DEPTH = 0
+
+# Monotonic per-process counter giving each ProcessPoolExecutor a unique
+# identity, used to bind published ObjectHandle instances to their executor.
+_executor_id_counter = itertools.count()
 
 # Minimum time interval between two consecutive memory leak protection checks.
 _MEMORY_LEAK_CHECK_DELAY = 1.0
@@ -274,13 +283,17 @@ def _rebuild_exc(exc, tb):
 
 class _WorkItem:
 
-    __slots__ = ["future", "fn", "args", "kwargs"]
+    __slots__ = ["future", "fn", "args", "kwargs", "object_keys"]
 
-    def __init__(self, future, fn, args, kwargs):
+    def __init__(self, future, fn, args, kwargs, object_keys=()):
         self.future = future
         self.fn = fn
         self.args = args
         self.kwargs = kwargs
+        # Keys of the published objects used by this work item, in the order
+        # in which they must be passed to the user function. Empty for plain
+        # submit() calls, which never resolve handles implicitly.
+        self.object_keys = tuple(object_keys)
 
 
 class _ResultItem:
@@ -291,18 +304,22 @@ class _ResultItem:
 
 
 class _CallItem:
-    def __init__(self, work_id, fn, args, kwargs):
+    def __init__(self, work_id, fn, args, kwargs, object_keys=()):
         self.work_id = work_id
         self.fn = fn
         self.args = args
         self.kwargs = kwargs
+        self.object_keys = tuple(object_keys)
 
         # Store the current loky_pickler so it is correctly set in the worker
         self.loky_pickler = get_loky_pickler_name()
 
-    def __call__(self):
+    def __call__(self, resolved_objects=()):
         set_loky_pickler(self.loky_pickler)
-        return self.fn(*self.args, **self.kwargs)
+        # Published objects are passed as independent leading positional
+        # arguments, in the order of the explicit `objects` list. The regular
+        # args/kwargs are never scanned for handles.
+        return self.fn(*resolved_objects, *self.args, **self.kwargs)
 
     def __repr__(self):
         return (
@@ -441,6 +458,8 @@ def _process_worker(
     timeout,
     worker_exit_lock,
     current_depth,
+    object_request_queue,
+    object_response_reader,
 ):
     """Evaluates calls from call_queue and places the results in result_queue.
 
@@ -460,6 +479,10 @@ def _process_worker(
         worker_exit_lock: Lock to avoid flagging the executor as broken on
             workers timeout.
         current_depth: Nested parallelism level, to avoid infinite spawning.
+        object_request_queue: A ctx.SimpleQueue used to request published
+            object snapshots to the executor parent process.
+        object_response_reader: A ctx.Connection on which the parent process
+            sends published object snapshots and release commands.
     """
     if initializer is not None:
         try:
@@ -476,6 +499,14 @@ def _process_worker(
     _process_reference_size = None
     _last_memory_leak_check = None
     pid = os.getpid()
+
+    # Per-process cache of published objects. It is intentionally local to
+    # this worker process: a recycled worker starts with an empty cache and
+    # restores snapshots from the parent on demand, instead of inheriting the
+    # loaded markers of the previous pid.
+    object_cache = _WorkerObjectCache(
+        pid, object_request_queue, object_response_reader
+    )
 
     mp.util.debug(f"Worker started with timeout={timeout}")
     _enable_faulthandler_if_needed()
@@ -519,7 +550,11 @@ def _process_worker(
                 mp.util.info("Main process did not release worker_exit")
             return
         try:
-            r = call_item()
+            # Resolve published objects on demand from the per-process cache.
+            # A load failure raises ObjectHandleError and fails this task only,
+            # like any other user exception, without breaking the worker.
+            resolved_objects = object_cache.resolve(call_item.object_keys)
+            r = call_item(resolved_objects)
         except BaseException as e:
             exc = _ExceptionWithTraceback(e)
             result_queue.put(_ResultItem(call_item.work_id, exception=exc))
@@ -530,6 +565,10 @@ def _process_worker(
         # Free the resource as soon as possible, to avoid holding onto
         # open files or shared memory that is not needed anymore
         del call_item
+
+        # Process pending release commands between tasks so that a cached
+        # snapshot can never be removed while a task is using it.
+        object_cache.process_release_commands()
 
         if _USE_PSUTIL:
             if _process_reference_size is None:
@@ -638,6 +677,9 @@ class _ExecutorManagerThread(threading.Thread):
         # A list of the work_ids that are currently running
         self.running_work_items = executor._running_work_items
 
+        # Parent-side infrastructure for published objects
+        self.object_infra = executor._objects
+
         # A lock to avoid concurrent shutdown of workers on timeout and spawn
         # of new processes or shut down
         self.processes_management_lock = executor._processes_management_lock
@@ -730,11 +772,16 @@ class _ExecutorManagerThread(threading.Thread):
                             work_item.fn,
                             work_item.args,
                             work_item.kwargs,
+                            work_item.object_keys,
                         ),
                         block=True,
                     )
                 else:
                     del self.pending_work_items[work_id]
+                    # A cancelled task never reached the workers: give back
+                    # its published object usage reservations so release can
+                    # complete once the last in-flight user finishes.
+                    self._return_work_item_objects(work_item)
                     continue
 
     def wait_result_broken_or_wakeup(self):
@@ -836,6 +883,18 @@ class _ExecutorManagerThread(threading.Thread):
                 p.join()
                 del p
 
+            # The worker process is gone: close its published-object response
+            # pipe and forget every copy it held. The replacement worker gets
+            # a fresh pid, an empty cache and a new pipe, so it cannot inherit
+            # the loaded markers of the worker it replaces.
+            writer = self.object_infra.pop_writer(result_item)
+            if writer is not None:
+                try:
+                    writer.close()
+                except OSError:
+                    pass
+            self.object_infra.registry.remove_holder(result_item)
+
             # Make sure the executor have the right number of worker, even if a
             # worker timeout while some jobs were submitted. If some work is
             # pending or there is less processes than running items, we need to
@@ -885,6 +944,20 @@ class _ExecutorManagerThread(threading.Thread):
                 else:
                     work_item.future.set_result(result_item.result)
                 self.running_work_items.remove(result_item.work_id)
+                # The task is done: release its published object usage
+                # reservations, finalizing snapshots whose last in-flight
+                # user just completed.
+                self._return_work_item_objects(work_item)
+
+    def _return_work_item_objects(self, work_item):
+        # Give back the published object usage reservations of a completed or
+        # cancelled work item. All bookkeeping is lock-protected and cheap, so
+        # result management is not blocked by snapshot transfers.
+        object_keys = work_item.object_keys
+        if not object_keys:
+            return
+        finalized = self.object_infra.registry.return_usages(object_keys)
+        self.object_infra.dispatch_finalized(finalized)
 
     def is_shutting_down(self):
         # Check whether we should start shutting down the executor.
@@ -919,6 +992,7 @@ class _ExecutorManagerThread(threading.Thread):
                 # cancelled between the check and set_exception().
                 pass
             # Delete references to object. See issue16284
+            self._return_work_item_objects(work_item)
             del work_item
         self.pending_work_items.clear()
 
@@ -951,6 +1025,9 @@ class _ExecutorManagerThread(threading.Thread):
                         "before this job could complete."
                     )
                 )
+                # Those tasks will never run: give back their published
+                # object usage reservations before the full cleanup.
+                self._return_work_item_objects(work_item)
                 del work_item
 
             # Kill the remaining worker forcibly to no waste time joining them
@@ -1053,6 +1130,11 @@ class _ExecutorManagerThread(threading.Thread):
                 "executor management thread clean shutdown of "
                 f"{n_joined_processes} workers"
             )
+
+        # Stop the object control thread and drop every published snapshot,
+        # response pipe and worker copy reference. Covers both the clean
+        # shutdown and the broken executor cleanup paths.
+        self.object_infra.shutdown()
 
     def get_n_children_alive(self):
         # This is an upper bound on the number of children alive.
@@ -1222,8 +1304,15 @@ class ProcessPoolExecutor(Executor):
         if result_reducers is None:
             result_reducers = job_reducers
 
+        # Keep the job reducers around so publish_object encodes snapshots
+        # with the exact same rules as regular task pickling.
+        self._job_reducers = job_reducers
+
         # Timeout
         self._timeout = timeout
+
+        # Unique identity of this executor, binding its ObjectHandle objects
+        self._executor_id = next(_executor_id_counter)
 
         # Management thread
         self._executor_manager_thread = None
@@ -1257,6 +1346,11 @@ class ProcessPoolExecutor(Executor):
 
         # Finally setup the queues for interprocess communication
         self._setup_queues(job_reducers, result_reducers)
+
+        # Parent-side infrastructure backing publish_object and
+        # submit_with_objects: snapshot registry, worker request queue,
+        # per-worker response pipes and the dedicated control thread.
+        self._objects = _ObjectInfrastructure(self._executor_id, self._context)
 
         mp.util.debug("ProcessPoolExecutor is setup")
 
@@ -1318,6 +1412,9 @@ class ProcessPoolExecutor(Executor):
     def _adjust_process_count(self):
         while len(self._processes) < self._max_workers:
             worker_exit_lock = self._context.BoundedSemaphore(1)
+            # Per-worker pipe used by the parent to send published object
+            # snapshots and release commands to this specific worker.
+            object_reader, object_writer = self._context.Pipe(duplex=False)
             args = (
                 self._call_queue,
                 self._result_queue,
@@ -1327,6 +1424,8 @@ class ProcessPoolExecutor(Executor):
                 self._timeout,
                 worker_exit_lock,
                 _CURRENT_DEPTH + 1,
+                self._objects.request_queue,
+                object_reader,
             )
             worker_exit_lock.acquire()
             try:
@@ -1338,7 +1437,12 @@ class ProcessPoolExecutor(Executor):
             except TypeError:
                 p = self._context.Process(target=_process_worker, args=args)
             p._worker_exit_lock = worker_exit_lock
+            p._object_response_writer = object_writer
             p.start()
+            # The child inherited its own copy of the reader end; the parent
+            # only keeps the writer end.
+            object_reader.close()
+            self._objects.add_writer(p.pid, object_writer)
             self._processes[p.pid] = p
         mp.util.debug(
             f"Adjusted process count to {self._max_workers}: "
@@ -1381,6 +1485,106 @@ class ProcessPoolExecutor(Executor):
             return f
 
     submit.__doc__ = Executor.submit.__doc__
+
+    def publish_object(self, obj):
+        """Publish a read-only object and return an opaque handle.
+
+        ``obj`` is serialized synchronously, using the same ``job_reducers``
+        rules as regular task pickling, and the resulting snapshot is kept
+        once in the executor parent process. Mutating ``obj`` in the parent
+        after publication has no effect on the snapshot. Each worker that
+        actually uses the object deserializes the snapshot at most once and
+        then reuses its own local copy.
+
+        If serialization fails, no usable handle is created and the
+        serialization exception is re-raised.
+
+        Args:
+            obj: the picklable read-only object to publish.
+
+        Returns:
+            ObjectHandle: an opaque handle bound to this executor and to the
+            publish generation. Pass it to :meth:`submit_with_objects` to
+            use the snapshot in worker tasks.
+        """
+        with self._flags.shutdown_lock:
+            if self._flags.broken is not None:
+                raise self._flags.broken
+            if self._flags.shutdown:
+                raise ShutdownExecutorError(
+                    "cannot publish new objects after shutdown"
+                )
+            if _global_shutdown:
+                raise RuntimeError(
+                    "cannot publish new objects after interpreter shutdown"
+                )
+
+            # Serialize synchronously, before registering anything: a
+            # pickling failure must not leave a usable handle behind.
+            payload = bytes(dumps(obj, reducers=self._job_reducers))
+
+            # Start the dedicated control thread on first publication so that
+            # worker load requests can be served off the manager thread.
+            self._objects.ensure_control_thread()
+            return self._objects.registry.publish(payload, self)
+
+    def submit_with_objects(self, fn, objects, /, *args, **kwargs):
+        """Submit ``fn`` using published read-only objects.
+
+        Only the handles explicitly listed in ``objects`` are resolved; the
+        regular ``args`` and ``kwargs`` are never scanned for handles and a
+        plain :meth:`submit` call never resolves a handle either. The
+        resolved objects are passed to ``fn`` as independent leading
+        positional arguments, in the order of the ``objects`` list, i.e. as
+        ``fn(obj_0, obj_1, ..., *args, **kwargs)``.
+
+        Repeating a handle inside ``objects`` keeps its position and maps to
+        the exact same local object in the worker.
+
+        Args:
+            fn: the callable to execute.
+            objects: a sequence of :class:`ObjectHandle` returned by
+                :meth:`publish_object` on this executor.
+            *args, **kwargs: extra regular arguments forwarded to ``fn``;
+                they are not inspected for handles.
+
+        Returns:
+            Future: a future representing the execution of the call.
+        """
+        with self._flags.shutdown_lock:
+            if self._flags.broken is not None:
+                raise self._flags.broken
+            if self._flags.shutdown:
+                raise ShutdownExecutorError(
+                    "cannot schedule new futures after shutdown"
+                )
+            if _global_shutdown:
+                raise RuntimeError(
+                    "cannot schedule new futures after interpreter shutdown"
+                )
+
+            # Validates every handle (executor identity, generation, released
+            # state) and reserves one usage per occurrence, before anything
+            # is enqueued. A failed validation raises ObjectHandleError and
+            # leaves no reservation behind.
+            object_keys = self._objects.registry.acquire(tuple(objects))
+
+            f = Future()
+            w = _WorkItem(f, fn, args, kwargs, object_keys=object_keys)
+
+            self._pending_work_items[self._queue_count] = w
+            self._work_ids.put(self._queue_count)
+            self._queue_count += 1
+            # Wake up queue management thread
+            self._executor_manager_thread_wakeup.wakeup()
+
+            self._ensure_executor_running()
+            return f
+
+    def _release_object(self, key):
+        """Release a published snapshot through its :class:`ObjectHandle`."""
+        finalized = self._objects.registry.release(key)
+        self._objects.dispatch_finalized(finalized)
 
     def map(self, fn, *iterables, **kwargs):
         """Returns an iterator equivalent to map(fn, iter).

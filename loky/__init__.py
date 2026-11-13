@@ -16,6 +16,7 @@ from concurrent.futures import (
 )
 
 from ._base import Future
+from ._objects import ObjectHandle, ObjectHandleError
 from .backend.context import cpu_count
 from .backend.reduction import set_loky_pickler
 from .reusable_executor import get_reusable_executor
@@ -32,6 +33,8 @@ __all__ = [
     "Executor",
     "ProcessPoolExecutor",
     "BrokenProcessPool",
+    "ObjectHandle",
+    "ObjectHandleError",
     "CancelledError",
     "TimeoutError",
     "FIRST_COMPLETED",
